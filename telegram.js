@@ -104,23 +104,20 @@ function safeJson(raw) {
 }
 
 async function transcribe(base64, mimeType) {
-  const fmt    = (mimeType || "audio/ogg").split("/")[1] || "ogg";
-  const prompt = "Transcribe this voice message. Nigerian Navy commander. Return ONLY valid JSON on one line: {\"transcript\":\"<text>\",\"confidence\":<number>}";
-  const raw = await qwen("qwen2-audio-instruct", [
-    {
-      role: "user",
-      content: [
-        { type: "input_audio", input_audio: { data: "data:" + mimeType + ";base64," + base64, format: fmt } },
-        { type: "text", text: prompt },
-      ],
-    },
-  ], 800);
-  try {
-    const p = safeJson(raw);
-    return { text: p.transcript || raw, conf: typeof p.confidence === "number" ? p.confidence : 0.5 };
-  } catch {
-    return { text: raw.trim(), conf: 0.4 };
-  }
+  const audioBuffer = Buffer.from(base64, "base64");
+  const form        = new FormData();
+  form.append("file",  new Blob([audioBuffer], { type: mimeType || "audio/ogg" }), "audio.ogg");
+  form.append("model", "whisper-1");
+
+  const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method:  "POST",
+    headers: { "Authorization": "Bearer " + process.env.OPENAI_API_KEY },
+    body:    form,
+  });
+
+  if (!res.ok) throw new Error("Whisper error " + res.status + ": " + (await res.text()).slice(0, 200));
+  const data = await res.json();
+  return { text: data.text || "", conf: 0.9 };
 }
 
 async function extractIntent(transcript) {
