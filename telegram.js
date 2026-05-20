@@ -409,7 +409,7 @@ function buildKxsPdf(data) {
 
     const stripDataUrl = (b64) => (b64 || "").replace(/^data:[^;]+;base64,/, "");
 
-    const fillR = (x, y, w, h, hex) => doc.rect(x, y, w, h).fill(hex);
+    const fillR = (x, y, w, h, hex) => { doc.save(); doc.rect(x, y, w, h).fill(hex); doc.restore(); };
 
     const classBanner = (y) => {
       fillR(0, y, W, 18, RED_BAN);
