@@ -247,9 +247,11 @@ async function extractSentinelParams(transcript) {
     "",
     "Return ONLY valid JSON:",
     "{",
-    "  \"location\": \"<place name>\",",
-    "  \"state\": \"<Nigerian state or empty string>\",",
-    "  \"lga\": \"<LGA name or empty string>\",",
+    "  \"location\": \"<most specific place name mentioned>\",",
+    "  \"state\": \"<Nigerian state name or empty string>\",",
+    "  \"lga\": \"<Local Government Area or empty string>\",",
+    "  \"ward\": \"<ward name if mentioned, else empty string>\",",
+    "  \"district\": \"<district or area name if mentioned, else empty string>\",",
     "  \"threat_type\": \"ILLEGAL_MINING|ENCAMPMENT|FOREST_CLEARANCE|FLOODING|HUMAN_TRACKING\",",
     "  \"days_back\": 30",
     "}",
@@ -258,11 +260,11 @@ async function extractSentinelParams(transcript) {
   const raw = await qwen("qwen2.5-72b-instruct", [
     { role: "system", content: sys  },
     { role: "user",   content: user },
-  ], 400);
+  ], 500);
 
   try { return safeJson(raw); }
   catch {
-    return { location: "Nigeria", state: "", lga: "", threat_type: "ENCAMPMENT", days_back: 30 };
+    return { location: "Nigeria", state: "", lga: "", ward: "", district: "", threat_type: "ENCAMPMENT", days_back: 30 };
   }
 }
 
@@ -279,6 +281,16 @@ async function callAnalyzeThreat(scene1Base64, scene2Base64, params, scene1Date,
   const lat  = (bbox[1] + bbox[3]) / 2;
   const lng  = (bbox[0] + bbox[2]) / 2;
 
+  // Build rich place context for higher ARES confidence
+  const placeParts = [
+    params.location && params.location !== params.state ? params.location : null,
+    params.ward     ? "Ward: " + params.ward         : null,
+    params.district ? "District: " + params.district : null,
+    params.lga      ? "LGA: " + params.lga           : null,
+    params.state    ? "State: " + params.state        : null,
+    "Threat type under investigation: " + (params.threat_type || "ENCAMPMENT"),
+  ].filter(Boolean).join(" · ");
+
   const res = await fetch(LOVABLE_URL + "/functions/v1/analyze-threat", {
     method:  "POST",
     headers: {
@@ -289,10 +301,12 @@ async function callAnalyzeThreat(scene1Base64, scene2Base64, params, scene1Date,
     body: JSON.stringify({
       image_before:  scene1Base64,
       image_after:   scene2Base64,
-      coordinates:   { lat, lng, radius_km: 25 },
-      lga_name:      params.lga   || "",
-      state_name:    params.state || params.location || "",
-      place_context: params.location || params.state || "",
+      coordinates:   { lat, lng, radius_km: 10 },
+      lga_name:      params.lga      || "",
+      state_name:    params.state    || params.location || "",
+      ward:          params.ward     || "",
+      district:      params.district || "",
+      place_context: placeParts,
       date_t1:       scene1Date,
       date_t2:       scene2Date,
       sensor:        "Sentinel-2",
@@ -508,7 +522,7 @@ function buildKxsPdf(data) {
       const gap   = 10;
       const hW    = (W - 2 * M - gap) / 2;
       const hdrH  = 19;
-      const imgH  = 210;
+      const imgH  = 270;
       const cardH = hdrH + imgH + 10;
 
       const drawCard = (x, label, date, b64) => {
@@ -519,8 +533,9 @@ function buildKxsPdf(data) {
            .text(label + " · " + (date || "").slice(0, 10), x + 7, y + 5, { lineBreak: false });
         if (b64) {
           try {
+            // fit scales to fill the box while maintaining aspect ratio — no truncation
             doc.image(Buffer.from(stripDataUrl(b64), "base64"),
-                      x + 4, y + hdrH + 3, { width: hW - 8, height: imgH - 6 });
+                      x + 4, y + hdrH + 3, { fit: [hW - 8, imgH - 6], align: "center", valign: "center" });
           } catch { /* keep blank panel */ }
         } else {
           doc.fillColor("#808080").font("Helvetica").fontSize(8)
