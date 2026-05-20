@@ -19,7 +19,7 @@ const db = createClient(
 // ── Constants ─────────────────────────────────────────────────────
 
 const TG   = "https://api.telegram.org/bot" + process.env.TELEGRAM_BOT_TOKEN;
-const QWEN = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
+const QWEN = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions";
 
 const RISK_COLOR = {
   CRITICAL: "#CC0000",
