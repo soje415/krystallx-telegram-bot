@@ -28,6 +28,22 @@ const RISK_COLOR = {
   LOW:      "#006600",
 };
 
+// Emergency keywords — false positive acceptable, missing real SOS is not
+const SOS_PATTERNS = [
+  /\bambush(ed|ing)?\b/i,
+  /\bunder\s+fire\b/i,
+  /\battack(ed|ing|ers?)?\b/i,
+  /\bmayday\b/i,
+  /\bS\.?O\.?S\b/,
+  /\bcasualt(y|ies)\b/i,
+  /\blast\s+message\b/i,
+  /\bman\s+down\b/i,
+  /\btaking\s+fire\b/i,
+  /\bbeing\s+shot\b/i,
+  /\bhelp\s+us\b/i,
+  /\bwe('re|\s+are)\s+(surrounded|pinned|hit)\b/i,
+];
+
 // ================================================================
 // TELEGRAM HELPERS
 // ================================================================
@@ -121,14 +137,39 @@ async function transcribe(base64, mimeType) {
 }
 
 async function extractIntent(transcript) {
-  const sys  = "Nigerian Navy intelligence analyst. Extract commander intent. Return ONLY valid JSON. No markdown.";
-  const user = "TRANSCRIPT: " + JSON.stringify(transcript) + "\n\nReturn ONLY:\n{\"intent\":\"VESSEL_REPORT|AREA_SCAN|THREAT_ALERT|STATUS_REQUEST|UNKNOWN\",\"entities\":{\"vessels\":[],\"coords\":[],\"threat_type\":\"\",\"time_ref\":\"\",\"action\":\"\"},\"summary\":\"<one sentence>\",\"confidence\":0.9}";
-  const raw  = await qwen("qwen2.5-72b-instruct", [
+  const sys  = "Nigerian Navy C4ISR analyst. Extract commander intent, emergency flags, and which platform modules are relevant. Return ONLY valid JSON. No markdown.";
+  const intentOpts = "VESSEL_REPORT|AREA_SCAN|THREAT_ALERT|STATUS_REQUEST|EMERGENCY_SOS|HUMINT_SUBMIT|UNKNOWN";
+  const moduleOpts = "MARITIME_QUERY|SENTINEL_SWEEP|SOCMINT|ENTITY_LOOKUP|HUMINT_SUBMIT";
+  const user = [
+    "TRANSCRIPT: " + JSON.stringify(transcript),
+    "",
+    "Return ONLY valid JSON (no extra keys):",
+    "{",
+    "  \"intent\": \"" + intentOpts + "\",",
+    "  \"is_sos\": false,",
+    "  \"modules\": [\"only relevant ones from: " + moduleOpts + "\"],",
+    "  \"entities\": {\"vessels\": [], \"coords\": [], \"threat_type\": \"\", \"time_ref\": \"\", \"action\": \"\"},",
+    "  \"summary\": \"<one sentence>\",",
+    "  \"confidence\": 0.9",
+    "}",
+  ].join("\n");
+
+  const raw = await qwen("qwen2.5-72b-instruct", [
     { role: "system", content: sys  },
     { role: "user",   content: user },
-  ], 600);
+  ], 700);
+
   try   { return safeJson(raw); }
-  catch { return { intent: "UNKNOWN", entities: {}, summary: transcript.slice(0, 120), confidence: 0.3 }; }
+  catch {
+    return {
+      intent: "UNKNOWN", is_sos: false, modules: [],
+      entities: {}, summary: transcript.slice(0, 120), confidence: 0.3,
+    };
+  }
+}
+
+function quickSosCheck(text) {
+  return SOS_PATTERNS.some((p) => p.test(text));
 }
 
 async function makeSitrep(name, unit, transcript, intent) {
@@ -243,7 +284,7 @@ async function runPipeline(msg, senderName) {
   const fileId   = msg.voice?.file_id || msg.audio?.file_id || "";
   const mimeType = msg.voice?.mime_type || msg.audio?.mime_type || "audio/ogg";
 
-  // 1. Security check
+  // 1. Security gate — silent block for unregistered senders
   const { data: src } = await db
     .from("humint_sources")
     .select("id, display_name, rank, unit, email, active")
@@ -266,7 +307,7 @@ async function runPipeline(msg, senderName) {
   const cdrName = ((src.rank || "") + " " + src.display_name).trim();
   const cdrUnit = src.unit || "UNKNOWN UNIT";
 
-  // 2. Log entry
+  // 2. Audit log entry
   const { data: logRow } = await db
     .from("commander_query_log")
     .insert({
@@ -283,7 +324,7 @@ async function runPipeline(msg, senderName) {
   await sendText(chatId, "Voice note received. Analysing report from " + cdrName + "... SITREP incoming.");
 
   try {
-    // 3. Download
+    // 3. Download audio
     const filePath                 = await getFilePath(fileId);
     const { base64, mimeType: dm } = await downloadAudio(filePath, mimeType);
 
@@ -291,23 +332,72 @@ async function runPipeline(msg, senderName) {
     const { text, conf } = await transcribe(base64, dm);
     console.log("[Pipeline] Transcript conf=" + conf + " | " + text.slice(0, 80));
 
-    // 5. Intent
+    // 5. SOS CHECK — fires before any other step (LIFE-SAFETY FIRST)
+    const fastSos = quickSosCheck(text);
+
+    // 6. Write field_request immediately for C2 visibility (Realtime notifies dashboard)
+    let fieldReqId = null;
+    try {
+      const { data: fr, error: frErr } = await db
+        .from("field_requests")
+        .insert({
+          source_id:   senderId,
+          source_name: cdrName,
+          unit:        cdrUnit,
+          channel:     "TELEGRAM",
+          transcript:  text,
+          status:      "PROCESSING",
+          is_sos:      fastSos,
+          risk_level:  fastSos ? "CRITICAL" : "MODERATE",
+          log_id:      logId,
+        })
+        .select("id")
+        .single();
+      if (frErr) console.warn("[FieldReq] Insert failed:", frErr.message);
+      else fieldReqId = fr?.id;
+    } catch (e) { console.warn("[FieldReq] Insert threw:", e.message); }
+
+    // 7. SOS immediate response — reply before SITREP pipeline completes
+    if (fastSos) {
+      await sendText(chatId, "EMERGENCY ACKNOWLEDGED. C2 notified. Stay on comms.");
+      console.warn("[SOS] EMERGENCY DETECTED - " + cdrName + " | " + text.slice(0, 120));
+    }
+
+    // 8. Intent extraction (parallel with SOS — both use transcript)
     const intent = await extractIntent(text);
-    console.log("[Pipeline] Intent: " + intent.intent);
+    console.log("[Pipeline] Intent: " + intent.intent + " | SOS: " + (intent.is_sos || fastSos));
 
-    // 6. SITREP
+    // Confirm and consolidate SOS flag
+    const isSos = fastSos || Boolean(intent.is_sos) || intent.intent === "EMERGENCY_SOS";
+
+    // 9. Update field_request with intent data
+    if (fieldReqId) {
+      await db.from("field_requests").update({
+        intent:         intent.intent,
+        summary:        intent.summary,
+        is_sos:         isSos,
+        risk_level:     isSos ? "CRITICAL" : "MODERATE",
+        modules_queued: intent.modules || [],
+        status:         isSos ? "SOS_ACTIVE" : "PROCESSING",
+      }).eq("id", fieldReqId);
+    }
+
+    // 10. SITREP generation
     const sitrep = await makeSitrep(cdrName, cdrUnit, text, intent);
+    if (isSos) sitrep.risk_level = "CRITICAL";
 
-    // 7. PDF
+    // 11. PDF build
     const pdf      = await buildPdf(sitrep);
     const filename = "SITREP_" + sitrep.dtg.slice(0, 10) + "_" + sitrep.risk_level + ".pdf";
     const note     = conf < 0.75 ? " [LOW CONFIDENCE - VERIFY]" : "";
-    const caption  = "SITREP " + sitrep.risk_level + " | " + sitrep.subject + "\n\n" + sitrep.assessment.slice(0, 250) + "\n\nACTION: " + sitrep.action.slice(0, 150) + note;
+    const caption  = "SITREP " + sitrep.risk_level + " | " + sitrep.subject
+      + "\n\n" + sitrep.assessment.slice(0, 250)
+      + "\n\nACTION: " + sitrep.action.slice(0, 150) + note;
 
-    // 8. Deliver
+    // 12. Deliver PDF
     await sendPdf(chatId, pdf, filename, caption);
 
-    // 9. Email (optional)
+    // 13. Email (optional)
     if (src.email && process.env.RESEND_API_KEY) {
       try {
         const mailer  = new Resend(process.env.RESEND_API_KEY);
@@ -323,7 +413,7 @@ async function runPipeline(msg, senderName) {
       } catch (e) { console.warn("[Pipeline] Email failed:", e.message); }
     }
 
-    // 10. Update log
+    // 14. Finalise audit log
     if (logId) {
       await db.from("commander_query_log").update({
         transcript:     text,
@@ -334,11 +424,19 @@ async function runPipeline(msg, senderName) {
       }).eq("id", logId);
     }
 
+    // 15. Close field_request
+    if (fieldReqId) {
+      await db.from("field_requests").update({
+        status:     isSos ? "SOS_ACTIVE" : "DELIVERED",
+        risk_level: sitrep.risk_level,
+      }).eq("id", fieldReqId);
+    }
+
     console.log("[Pipeline] Done - " + sitrep.risk_level + " - " + cdrName);
 
   } catch (err) {
     console.error("[Pipeline] Fatal:", err.message);
-    await sendText(chatId, "Processing failed: " + err.message.slice(0, 120) + ". Contact duty officer.");
+    await sendText(chatId, "Processing failed: " + err.message.slice(0, 120) + ". Contact duty officer. Ref: " + (logId || "unknown"));
     if (logId) {
       await db.from("commander_query_log")
         .update({ status: "FAILED", error_detail: err.message.slice(0, 500) })
@@ -393,4 +491,5 @@ app.listen(PORT, () => {
   console.log("[KXS] Bot token set: " + Boolean(process.env.TELEGRAM_BOT_TOKEN));
   console.log("[KXS] Supabase:      " + (process.env.SUPABASE_URL || "NOT SET"));
   console.log("[KXS] Qwen:          " + Boolean(process.env.QWEN_API_KEY));
+  console.log("[KXS] Groq:          " + Boolean(process.env.GROQ_API_KEY));
 });
