@@ -274,6 +274,37 @@ function resolveBbox(params) {
   return [2.5, 4.0, 14.7, 14.0]; // Nigeria fallback
 }
 
+async function callAnalyzeThreat(scene1Base64, scene2Base64, params, scene1Date, scene2Date) {
+  const bbox = resolveBbox(params);
+  const lat  = (bbox[1] + bbox[3]) / 2;
+  const lng  = (bbox[0] + bbox[2]) / 2;
+
+  const res = await fetch(LOVABLE_URL + "/functions/v1/analyze-threat", {
+    method:  "POST",
+    headers: {
+      "Content-Type":  "application/json",
+      "Authorization": "Bearer " + LOVABLE_KEY,
+      "apikey":        LOVABLE_KEY,
+    },
+    body: JSON.stringify({
+      image_before:  scene1Base64,
+      image_after:   scene2Base64,
+      coordinates:   { lat, lng, radius_km: 25 },
+      lga_name:      params.lga   || "",
+      state_name:    params.state || params.location || "",
+      place_context: params.location || params.state || "",
+      date_t1:       scene1Date,
+      date_t2:       scene2Date,
+      sensor:        "Sentinel-2",
+    }),
+  });
+
+  if (!res.ok) throw new Error("ARES error " + res.status + ": " + (await res.text()).slice(0, 200));
+  const data = await res.json();
+  if (data.error && !data.sitrep) throw new Error("ARES: " + data.error);
+  return data.sitrep;
+}
+
 async function callSentinelCommander(params) {
   const today   = new Date().toISOString().slice(0, 10);
   const daysAgo = new Date(Date.now() - (params.days_back || 30) * 86400000).toISOString().slice(0, 10);
@@ -342,69 +373,340 @@ async function makeSitrep(name, unit, transcript, intent) {
 }
 
 // ================================================================
-// PDF BUILDER
+// UNIFIED PDF BUILDER — matches KrystallX Shield frontend visual style
 // ================================================================
 
-function buildPdf(s) {
+function buildKxsPdf(data) {
   return new Promise((resolve, reject) => {
-    const doc    = new PDFDocument({ margin: 50, size: "A4" });
+    const doc    = new PDFDocument({ margin: 0, size: "A4" });
     const chunks = [];
     doc.on("data",  (c) => chunks.push(c));
     doc.on("end",   ()  => resolve(Buffer.concat(chunks)));
     doc.on("error", reject);
 
-    const color = RISK_COLOR[s.risk_level] || "#333333";
-    const w     = doc.page.width - 100;
+    // A4 points: 595.28 × 841.89  |  M=40pt ≈ 14mm
+    const W = 595.28, H = 841.89, M = 40;
+    const VOID_BG = "#0A0E1A";
+    const AMBER   = "#F59E0B";
+    const PANEL   = "#0F1629";
+    const RED_BAN = "#dc2626";
+    const DARK_HDR = "#1a2238";
+    const THREAT_HEX = { CRITICAL: "#ef4444", HIGH: "#f97316", MODERATE: "#facc15", LOW: "#22c55e" };
 
-    doc.rect(50, 40, w, 22).fill(color);
-    doc.fillColor("white").fontSize(10).font("Helvetica-Bold")
-       .text(s.classification + " - RISK: " + s.risk_level, 50, 46, { width: w, align: "center" });
+    const stripDataUrl = (b64) => (b64 || "").replace(/^data:[^;]+;base64,/, "");
 
-    doc.moveDown(2).fillColor("#000000").fontSize(15).font("Helvetica-Bold")
-       .text("KRYSTALLX SHIELD - C4ISR INTELLIGENCE REPORT", { align: "center" });
-    doc.fontSize(9).font("Helvetica").fillColor("#555555")
-       .text("Sovereignty Shield Platform - Nigerian Navy Intelligence", { align: "center" });
+    const fillR = (x, y, w, h, hex) => doc.rect(x, y, w, h).fill(hex);
 
-    doc.moveDown(0.5)
-       .moveTo(50, doc.y).lineTo(50 + w, doc.y).strokeColor("#aaaaaa").stroke()
-       .moveDown(0.5);
+    const classBanner = (y) => {
+      fillR(0, y, W, 18, RED_BAN);
+      doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(8)
+         .text("SECRET // KRYSTALLX SHIELD C4-ISR // NOFORN", 0, y + 5, { align: "center", width: W, lineBreak: false });
+    };
 
-    for (const [label, value] of [["DTG", s.dtg], ["FROM", s.from], ["TO", s.to], ["SUBJECT", s.subject]]) {
-      doc.fillColor("#000000").fontSize(10).font("Helvetica-Bold").text(label + ": ", { continued: true });
-      doc.font("Helvetica").text(value || "");
+    const secHdr = (label, y) => {
+      fillR(M, y, W - 2 * M, 16, AMBER);
+      doc.fillColor("#000000").font("Helvetica-Bold").fontSize(9)
+         .text(label, M + 6, y + 4, { lineBreak: false });
+      return y + 21;
+    };
+
+    const module    = data.module || "SITREP";
+    const issuedAt  = new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC";
+    const reportId  = "KX-" + module.slice(0, 3) + "-" + Date.now().toString(36).toUpperCase();
+    const risk      = (data.threat_level || data.risk_level || "MODERATE").toUpperCase();
+    const tHex      = THREAT_HEX[risk] || THREAT_HEX.MODERATE;
+
+    // ── PAGE 1: COVER ─────────────────────────────────────────────
+    fillR(0, 0, W, H, VOID_BG);
+    classBanner(0);
+    classBanner(H - 18);
+
+    doc.fillColor(AMBER).font("Helvetica-Bold").fontSize(26)
+       .text("KRYSTALLX", 0, 50, { align: "center", width: W, lineBreak: false });
+    doc.fontSize(13).fillColor("#ffffff")
+       .text("S H I E L D", 0, 80, { align: "center", width: W, lineBreak: false });
+    doc.fontSize(7.5).fillColor("#b4b4b4")
+       .text("SOVEREIGN COMMAND & CONTROL — INTELLIGENCE, SURVEILLANCE, RECONNAISSANCE",
+             0, 97, { align: "center", width: W, lineBreak: false });
+
+    doc.moveTo(M, 114).lineTo(W - M, 114).strokeColor(AMBER).lineWidth(1).stroke();
+
+    const [tl1, tl2] = module === "SENTINEL"
+      ? ["SATELLITE CHANGE-DETECTION", "THREAT ASSESSMENT"]
+      : module === "HUMINT"
+      ? ["HUMAN INTELLIGENCE", "FIELD REPORT"]
+      : ["SITUATION REPORT", "C4ISR ASSESSMENT"];
+
+    doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(17)
+       .text(tl1, 0, 124, { align: "center", width: W, lineBreak: false });
+    doc.fontSize(17)
+       .text(tl2, 0, 145, { align: "center", width: W, lineBreak: false });
+    doc.moveTo(M, 168).lineTo(W - M, 168).strokeColor(AMBER).lineWidth(1).stroke();
+
+    // Threat level tile
+    fillR(M, 180, W - 2 * M, 95, PANEL);
+    doc.rect(M, 180, W - 2 * M, 95).strokeColor(tHex).lineWidth(3).stroke();
+    doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(9).text("THREAT LEVEL", M + 10, 193, { lineBreak: false });
+    doc.fillColor(tHex).fontSize(26).text(risk, M + 10, 210, { lineBreak: false });
+    const threatType = (data.threat_type || data.intent || module).toUpperCase();
+    doc.fillColor("#ffffff").fontSize(9).text("CATEGORY", W - M - 190, 193, { lineBreak: false });
+    doc.fillColor(AMBER).fontSize(13).text(threatType, W - M - 190, 208, { lineBreak: false });
+    if (data.analyst_confidence) {
+      doc.fillColor("#ffffff").font("Helvetica").fontSize(8)
+         .text("Confidence: " + data.analyst_confidence, W - M - 190, 228, { lineBreak: false });
     }
 
-    doc.moveDown(0.5)
-       .moveTo(50, doc.y).lineTo(50 + w, doc.y).strokeColor("#aaaaaa").stroke()
-       .moveDown(0.8);
+    // Metadata table
+    let cy = 295;
+    const meta = module === "SENTINEL"
+      ? [
+          ["LOCATION",   data.location || data.state_name || "Nigeria"],
+          ["AOI BBOX",   (data.bbox || []).map((n) => (+n).toFixed(4)).join(", ")],
+          ["SENSOR",     data.sensor || "Sentinel-2"],
+          ["SCENE T1",   (data.scene1_date || "").slice(0, 10)],
+          ["SCENE T2",   (data.scene2_date || "").slice(0, 10)],
+          ["ANALYST",    "KrystallX ARES AI · Satellite Intel"],
+          ["REPORT ID",  reportId],
+          ["ISSUED",     issuedAt],
+        ]
+      : module === "HUMINT"
+      ? [
+          ["COMMANDER",   data.commander || ""],
+          ["UNIT",        data.unit || ""],
+          ["CHANNEL",     "TELEGRAM · ENCRYPTED"],
+          ["REF NUMBER",  data.ref_number || ""],
+          ["THREAT LEVEL", risk],
+          ["REPORT ID",   reportId],
+          ["ISSUED",      issuedAt],
+        ]
+      : [
+          ["COMMANDER",  data.commander || ""],
+          ["UNIT",       data.unit || ""],
+          ["DTG",        data.dtg || ""],
+          ["FROM",       data.from || ""],
+          ["TO",         data.to || "NNS BEECROFT / C4ISR OPS CENTRE"],
+          ["RISK LEVEL", risk],
+          ["REPORT ID",  reportId],
+          ["ISSUED",     issuedAt],
+        ];
 
-    for (const [heading, body] of [
-      ["1. SITUATION",       s.situation],
-      ["2. ENEMY FORCES",    s.enemy_forces],
-      ["3. FRIENDLY FORCES", s.friendly_forces],
-      ["4. ASSESSMENT",      s.assessment],
-      ["5. ACTION",          s.action],
-    ]) {
-      doc.font("Helvetica-Bold").fontSize(10).fillColor("#000000").text(heading);
-      doc.font("Helvetica").fillColor("#222222").text(body || "", { indent: 10 });
-      doc.moveDown(0.7);
+    for (const [k, v] of meta) {
+      doc.fillColor("#a0a0a0").font("Helvetica-Bold").fontSize(8).text(k, M, cy, { lineBreak: false });
+      doc.fillColor("#ffffff").font("Helvetica").text(String(v || ""), M + 80, cy, { lineBreak: false });
+      cy += 16;
     }
 
-    if (s.coordinating_info) {
-      doc.moveTo(50, doc.y).lineTo(50 + w, doc.y).strokeColor("#aaaaaa").stroke().moveDown(0.4);
-      doc.font("Helvetica-Bold").text("COORDINATING INFORMATION:");
-      doc.font("Helvetica").text(s.coordinating_info, { indent: 10 });
-      doc.moveDown(0.7);
+    // ── PAGE 2 ─────────────────────────────────────────────────────
+    doc.addPage();
+    fillR(0, 0, W, H, VOID_BG);
+    classBanner(0);
+    classBanner(H - 18);
+    let y = 26;
+
+    if (module === "SENTINEL") {
+      y = secHdr("SCENE COMPARISON — T1 (BEFORE) vs T2 (AFTER)", y);
+      const gap   = 10;
+      const hW    = (W - 2 * M - gap) / 2;
+      const hdrH  = 19;
+      const imgH  = 210;
+      const cardH = hdrH + imgH + 10;
+
+      const drawCard = (x, label, date, b64) => {
+        fillR(x, y, hW, cardH, PANEL);
+        fillR(x, y, hW, hdrH, DARK_HDR);
+        doc.rect(x, y, hW, cardH).strokeColor(AMBER).lineWidth(0.8).stroke();
+        doc.fillColor(AMBER).font("Helvetica-Bold").fontSize(9)
+           .text(label + " · " + (date || "").slice(0, 10), x + 7, y + 5, { lineBreak: false });
+        if (b64) {
+          try {
+            doc.image(Buffer.from(stripDataUrl(b64), "base64"),
+                      x + 4, y + hdrH + 3, { width: hW - 8, height: imgH - 6 });
+          } catch { /* keep blank panel */ }
+        } else {
+          doc.fillColor("#808080").font("Helvetica").fontSize(8)
+             .text("(snapshot unavailable)", x + hW / 2 - 50, y + hdrH + imgH / 2, { lineBreak: false });
+        }
+      };
+
+      drawCard(M,            "T1 BEFORE", data.scene1_date, data.t1_image);
+      drawCard(M + hW + gap, "T2 AFTER",  data.scene2_date, data.t2_image);
+      y += cardH + 14;
+
+      // Observations two-column
+      const t1Obs = (data.t1_observations || []).slice(0, 5);
+      const t2Obs = (data.t2_observations || []).slice(0, 5);
+      doc.fillColor(AMBER).font("Helvetica-Bold").fontSize(9)
+         .text("T1 OBSERVATIONS", M, y, { lineBreak: false })
+         .text("T2 OBSERVATIONS", M + hW + gap, y, { lineBreak: false });
+      y += 13;
+      let ly1 = y, ly2 = y;
+      doc.font("Helvetica").fontSize(8).fillColor("#dcdcdc");
+      for (const obs of t1Obs) {
+        doc.text("• " + obs, M, ly1, { width: hW - 6 });
+        ly1 += doc.heightOfString("• " + obs, { width: hW - 6 }) + 3;
+      }
+      for (const obs of t2Obs) {
+        doc.text("• " + obs, M + hW + gap, ly2, { width: hW - 6 });
+        ly2 += doc.heightOfString("• " + obs, { width: hW - 6 }) + 3;
+      }
+      y = Math.max(ly1, ly2) + 14;
+
+      if (data.change_summary) {
+        y = secHdr("CHANGE SUMMARY", y);
+        doc.font("Helvetica").fontSize(9).fillColor("#e6e6e6")
+           .text(data.change_summary, M, y, { width: W - 2 * M });
+      }
+
+    } else if (module === "HUMINT") {
+      const ent = data.entities || {};
+      const tblW = W - 2 * M;
+      const col  = tblW / 3;
+
+      const drawTable = (title, rows, cols) => {
+        if (!rows || rows.length === 0) return;
+        if (y > H - 120) {
+          doc.addPage(); fillR(0, 0, W, H, VOID_BG); classBanner(0); classBanner(H - 18); y = 26;
+        }
+        y = secHdr(title, y);
+        fillR(M, y, tblW, 16, DARK_HDR);
+        doc.fillColor(AMBER).font("Helvetica-Bold").fontSize(8);
+        let cx = M + 5;
+        for (const [lbl, cw] of cols) { doc.text(lbl, cx, y + 4, { lineBreak: false }); cx += cw; }
+        y += 16;
+        doc.font("Helvetica").fontSize(8).fillColor("#dcdcdc");
+        for (let i = 0; i < rows.length; i++) {
+          if (y > H - 60) {
+            doc.addPage(); fillR(0, 0, W, H, VOID_BG); classBanner(0); classBanner(H - 18); y = 26;
+          }
+          if (i % 2 === 0) fillR(M, y, tblW, 14, PANEL);
+          cx = M + 5;
+          for (const [, cw, field] of cols) {
+            doc.text(String(rows[i][field] || ""), cx, y + 3, { width: cw - 6, lineBreak: false, ellipsis: true });
+            cx += cw;
+          }
+          y += 14;
+        }
+        y += 8;
+      };
+
+      drawTable("PERSONS OF INTEREST", ent.persons,
+        [["NAME", col, "name"], ["ROLE", col, "role"], ["LOCATION", col, "location"]]);
+      drawTable("VEHICLES / WATERCRAFT", ent.vehicles,
+        [["TYPE", col, "type"], ["IDENTIFIER", col, "identifier"], ["DESCRIPTION", col, "description"]]);
+      drawTable("GROUPS / ORGANISATIONS", ent.groups,
+        [["NAME", col, "name"], ["TYPE", col, "type"], ["LOCATION", col, "location"]]);
+      drawTable("ACTIVITIES", ent.activities,
+        [["DESCRIPTION", col * 2, "description"], ["TIME REF", col, "time_ref"]]);
+      drawTable("WEAPONS / EQUIPMENT", ent.weapons,
+        [["TYPE", col, "type"], ["DESCRIPTION", col * 2, "description"]]);
+      drawTable("LOCATIONS", ent.locations,
+        [["NAME", col, "name"], ["DESCRIPTION", col, "description"], ["GRID REF", col, "grid_ref"]]);
+
+    } else {
+      // SITREP NATO sections
+      for (const [heading, body] of [
+        ["1. SITUATION",       data.situation],
+        ["2. ENEMY FORCES",    data.enemy_forces],
+        ["3. FRIENDLY FORCES", data.friendly_forces],
+        ["4. ASSESSMENT",      data.assessment],
+        ["5. ACTION",          data.action],
+      ]) {
+        if (!body) continue;
+        if (y > H - 120) {
+          doc.addPage(); fillR(0, 0, W, H, VOID_BG); classBanner(0); classBanner(H - 18); y = 26;
+        }
+        y = secHdr(heading, y);
+        doc.font("Helvetica").fontSize(9).fillColor("#e6e6e6").text(body, M, y, { width: W - 2 * M });
+        y += doc.heightOfString(body, { width: W - 2 * M }) + 14;
+      }
+      if (data.coordinating_info) {
+        y = secHdr("COORDINATING INFORMATION", y);
+        doc.font("Helvetica").fontSize(9).fillColor("#e6e6e6")
+           .text(data.coordinating_info, M, y, { width: W - 2 * M });
+      }
     }
 
-    doc.moveDown(0.5).font("Helvetica-Bold").fontSize(13).fillColor(color)
-       .text("THREAT ASSESSMENT: " + s.risk_level, { align: "center" });
+    // ── PAGE 3: INTEL & RECOMMENDATION ────────────────────────────
+    doc.addPage();
+    fillR(0, 0, W, H, VOID_BG);
+    classBanner(0);
+    classBanner(H - 18);
+    y = 26;
 
-    doc.moveDown(1)
-       .moveTo(50, doc.y).lineTo(50 + w, doc.y).strokeColor("#aaaaaa").stroke()
-       .moveDown(0.4);
-    doc.fontSize(8).fillColor("#888888").font("Helvetica")
-       .text("KrystallX Shield AI - " + new Date().toUTCString() + " - " + s.classification, { align: "center" });
+    if (module === "SENTINEL") {
+      y = secHdr("INTELLIGENCE NARRATIVE", y);
+      const narr = data.executive_summary || "Analysis pending.";
+      doc.font("Helvetica").fontSize(9).fillColor("#e6e6e6").text(narr, M, y, { width: W - 2 * M });
+      y += doc.heightOfString(narr, { width: W - 2 * M }) + 16;
+
+      const inds = data.threat_indicators || [];
+      if (inds.length) {
+        y = secHdr("KEY INDICATORS", y);
+        doc.font("Helvetica").fontSize(9).fillColor("#e6e6e6");
+        for (const ind of inds) {
+          const line = "▸ [" + ind.severity + "] " + ind.type + ": " + ind.description;
+          doc.text(line, M, y, { width: W - 2 * M });
+          y += doc.heightOfString(line, { width: W - 2 * M }) + 5;
+        }
+        y += 8;
+      }
+
+      const coords = inds.filter((i) => i.lat && i.lng);
+      if (coords.length) {
+        y = secHdr("SUSPECT COORDINATES", y);
+        fillR(M, y, W - 2 * M, 16, DARK_HDR);
+        doc.fillColor(AMBER).font("Helvetica-Bold").fontSize(8)
+           .text("TYPE", M + 5, y + 4, { lineBreak: false })
+           .text("LATITUDE",  M + 255, y + 4, { lineBreak: false })
+           .text("LONGITUDE", M + 370, y + 4, { lineBreak: false });
+        y += 16;
+        doc.font("Helvetica").fontSize(8).fillColor("#dcdcdc");
+        coords.forEach((c, i) => {
+          if (i % 2 === 0) fillR(M, y, W - 2 * M, 14, PANEL);
+          doc.text(c.type || "", M + 5, y + 3, { width: 245, lineBreak: false, ellipsis: true });
+          doc.text((+c.lat).toFixed(4) + "°N", M + 255, y + 3, { lineBreak: false });
+          doc.text((+c.lng).toFixed(4) + "°E", M + 370, y + 3, { lineBreak: false });
+          y += 14;
+        });
+        y += 10;
+      }
+
+      const recActs = (data.recommended_actions || []).join(" · ");
+      if (recActs) {
+        y = secHdr("RECOMMENDED ACTION", y);
+        fillR(M, y, W - 2 * M, 38, "#111111");
+        doc.rect(M, y, W - 2 * M, 38).strokeColor(AMBER).lineWidth(1.7).stroke();
+        doc.fillColor(AMBER).font("Helvetica-Bold").fontSize(10)
+           .text(recActs, M + 7, y + 7, { width: W - 2 * M - 14 });
+        y += 46;
+      }
+
+      if ((data.recommended_units || []).length) {
+        y = secHdr("RECOMMENDED RESPONDER UNITS", y);
+        doc.font("Helvetica").fontSize(9).fillColor("#e6e6e6");
+        for (const u of data.recommended_units) { doc.text("• " + u, M, y); y += 13; }
+        y += 8;
+      }
+
+    } else {
+      y = secHdr("THREAT ASSESSMENT SUMMARY", y);
+      const summary = data.assessment || data.executive_summary || data.summary || "No assessment available.";
+      doc.font("Helvetica").fontSize(9).fillColor("#e6e6e6").text(summary, M, y, { width: W - 2 * M });
+    }
+
+    // Signature block — all modules
+    if (y > H - 90) {
+      doc.addPage(); fillR(0, 0, W, H, VOID_BG); classBanner(0); classBanner(H - 18); y = 40;
+    }
+    doc.moveTo(M, y + 4).lineTo(W - M, y + 4).strokeColor(AMBER).lineWidth(0.8).stroke();
+    doc.fillColor(AMBER).font("Helvetica-Bold").fontSize(8)
+       .text("AUTHORIZED BY", M, y + 12, { lineBreak: false })
+       .text("DISPATCHED TO", W / 2, y + 12, { lineBreak: false });
+    doc.fillColor("#ffffff").font("Helvetica")
+       .text("KrystallX ARES AI · Intelligence System", M, y + 24, { lineBreak: false })
+       .text("Tactical Commander, Field Operations", W / 2, y + 24, { lineBreak: false });
+    doc.fillColor("#a0a0a0").fontSize(7)
+       .text("Report ID: " + reportId + "  •  Issued " + issuedAt, M, y + 36, { lineBreak: false });
 
     doc.end();
   });
@@ -547,54 +849,159 @@ async function runPipeline(msg, senderName) {
       }
     }
 
-    // 11. SENTINEL SWEEP — runs when commander requests satellite imagery
+    // 11. SENTINEL SWEEP — MPC raster fetch → ARES vision analysis
     let sentinelResult = null;
+    let aresResult     = null;
+    let sentinelParams = null;
     const isSentinel = intent.intent === "AREA_SCAN"
       || (Array.isArray(intent.modules) && intent.modules.includes("SENTINEL_SWEEP"));
 
     if (isSentinel) {
       try {
         await sendText(chatId, "SENTINEL SWEEP initiated. Querying Planetary Computer satellite archive... ETA 30-60 seconds.");
-        const sentinelParams = await extractSentinelParams(text);
+        sentinelParams  = await extractSentinelParams(text);
         console.log("[SENTINEL] Params:", JSON.stringify(sentinelParams));
-        sentinelResult = await callSentinelCommander(sentinelParams);
-        const score = sentinelResult.threatScore ?? sentinelResult.results?.[0]?.threatScore ?? "N/A";
-        const sev   = sentinelResult.severity ?? sentinelResult.results?.[0]?.severity ?? "LOW";
-        await sendText(chatId, "SENTINEL COMPLETE. Threat score: " + score + " | Severity: " + sev + ". Generating SITREP...");
-        console.log("[SENTINEL] Done - score=" + score + " sev=" + sev);
+        sentinelResult  = await callSentinelCommander(sentinelParams);
+
+        // Extract raster crops from MPC response
+        const scene1  = sentinelResult.tiles?.scene1 || sentinelResult.results?.[0]?.tiles?.scene1;
+        const scene2  = sentinelResult.tiles?.scene2 || sentinelResult.results?.[0]?.tiles?.scene2;
+        const s1b64   = scene1?.crop_base64;
+        const s2b64   = scene2?.crop_base64;
+        const s1date  = scene1?.date || "";
+        const s2date  = scene2?.date || "";
+
+        if (s1b64 && s2b64) {
+          await sendText(chatId, "Raster imagery acquired. Running ARES change-detection analysis...");
+          aresResult = await callAnalyzeThreat(s1b64, s2b64, sentinelParams, s1date, s2date);
+          // Attach dates and images back for PDF builder
+          aresResult._t1_image  = s1b64;
+          aresResult._t2_image  = s2b64;
+          aresResult._s1date    = s1date;
+          aresResult._s2date    = s2date;
+          const mag  = aresResult.change_magnitude || "MODERATE";
+          const conf = aresResult.analyst_confidence || "MEDIUM";
+          await sendText(chatId, "ARES COMPLETE. Change magnitude: " + mag + " | Confidence: " + conf + ". Building SITREP...");
+          console.log("[ARES] Done - mag=" + mag + " conf=" + conf);
+        } else {
+          const score = sentinelResult.threatScore ?? sentinelResult.results?.[0]?.threatScore ?? "N/A";
+          const sev   = sentinelResult.severity ?? sentinelResult.results?.[0]?.severity ?? "LOW";
+          await sendText(chatId, "SENTINEL COMPLETE (no raster crops available). Score: " + score + " | " + sev + ". Generating text SITREP...");
+          console.log("[SENTINEL] Fallback - score=" + score + " sev=" + sev);
+        }
       } catch (e) {
         console.warn("[SENTINEL] Failed:", e.message);
         await sendText(chatId, "SENTINEL SWEEP error: " + e.message.slice(0, 160) + ". Generating text SITREP from voice report.");
       }
     }
 
-    // 12. SITREP generation — enrich with HUMINT and/or Sentinel data
+    // 12. SITREP generation — enrich with HUMINT and/or Sentinel/ARES data
+    const aresIntel = aresResult ? {
+      executive_summary: aresResult.executive_summary,
+      change_magnitude:  aresResult.change_magnitude,
+      analyst_confidence: aresResult.analyst_confidence,
+      threat_indicators: aresResult.threat_indicators,
+      recommended_actions: aresResult.recommended_actions,
+    } : null;
+
     const sitrepIntent = {
       ...intent,
       ...(humintEntities ? { humint: humintEntities } : {}),
-      ...(sentinelResult  ? { sentinel: {
-        brief:          sentinelResult.brief ?? sentinelResult.results?.[0]?.brief,
-        recommendation: sentinelResult.recommendation ?? sentinelResult.results?.[0]?.recommendation,
-        threat_score:   sentinelResult.threatScore ?? sentinelResult.results?.[0]?.threatScore,
-        severity:       sentinelResult.severity ?? sentinelResult.results?.[0]?.severity,
-        scene1_date:    sentinelResult.tiles?.scene1?.date ?? sentinelResult.results?.[0]?.tiles?.scene1?.date,
-        scene2_date:    sentinelResult.tiles?.scene2?.date ?? sentinelResult.results?.[0]?.tiles?.scene2?.date,
-        collection:     sentinelResult.collection,
+      ...(aresIntel      ? { sentinel: aresIntel }    : {}),
+      ...(sentinelResult && !aresIntel ? { sentinel: {
+        brief:       sentinelResult.brief ?? sentinelResult.results?.[0]?.brief,
+        threat_score: sentinelResult.threatScore ?? sentinelResult.results?.[0]?.threatScore,
+        severity:    sentinelResult.severity ?? sentinelResult.results?.[0]?.severity,
       }} : {}),
     };
     const sitrep = await makeSitrep(cdrName, cdrUnit, text, sitrepIntent);
     if (isSos) sitrep.risk_level = "CRITICAL";
-    if (sentinelResult && sentinelResult.severity === "CRITICAL") sitrep.risk_level = "CRITICAL";
+    if (aresResult?.change_magnitude === "CRITICAL") sitrep.risk_level = "CRITICAL";
 
-    // 13. PDF build
-    const pdf      = await buildPdf(sitrep);
-    const filename = "SITREP_" + sitrep.dtg.slice(0, 10) + "_" + sitrep.risk_level + ".pdf";
-    const note     = conf < 0.75 ? " [LOW CONFIDENCE - VERIFY]" : "";
-    const humintLine = humintRef ? "\n\nHUMINT REF: " + humintRef : "";
-    const caption  = "SITREP " + sitrep.risk_level + " | " + sitrep.subject
-      + humintLine
-      + "\n\n" + sitrep.assessment.slice(0, 220)
-      + "\n\nACTION: " + sitrep.action.slice(0, 140) + note;
+    // 13. PDF build — unified KXS dark-theme format
+    let pdf, filename, caption;
+    const note = conf < 0.75 ? " [LOW CONFIDENCE - VERIFY]" : "";
+
+    if (isSentinel && (aresResult || sentinelResult)) {
+      // SENTINEL PDF — dark cover + T1/T2 imagery + ARES intel
+      const bbox = resolveBbox(sentinelParams || {});
+      pdf = await buildKxsPdf({
+        module:             "SENTINEL",
+        threat_level:       aresResult?.change_magnitude || sitrep.risk_level,
+        threat_type:        sentinelParams?.threat_type || "ENCAMPMENT",
+        location:           sentinelParams?.location || sentinelParams?.state || "Nigeria",
+        state_name:         sentinelParams?.state || "",
+        bbox,
+        sensor:             "Sentinel-2 · MPC",
+        scene1_date:        aresResult?._s1date || "",
+        scene2_date:        aresResult?._s2date || "",
+        t1_image:           aresResult?._t1_image || null,
+        t2_image:           aresResult?._t2_image || null,
+        t1_observations:    aresResult?.t1_observations || [],
+        t2_observations:    aresResult?.t2_observations || [],
+        change_summary:     aresResult?.change_summary || "",
+        executive_summary:  aresResult?.executive_summary || sitrep.assessment,
+        threat_indicators:  aresResult?.threat_indicators || [],
+        recommended_actions: aresResult?.recommended_actions || [sitrep.action],
+        recommended_units:  aresResult?.recommended_units || [],
+        analyst_confidence: aresResult?.analyst_confidence || "MEDIUM",
+        commander:          cdrName,
+        unit:               cdrUnit,
+      });
+      filename = "SENTINEL_" + new Date().toISOString().slice(0, 10) + "_" + (aresResult?.change_magnitude || sitrep.risk_level) + ".pdf";
+      const mag  = aresResult?.change_magnitude || "N/A";
+      const conf2 = aresResult?.analyst_confidence || "MEDIUM";
+      const recAct = (aresResult?.recommended_actions || [sitrep.action])[0] || "";
+      caption = "SENTINEL REPORT · " + (sentinelParams?.location || sentinelParams?.state || "Nigeria")
+        + "\nChange magnitude: " + mag + " · Confidence: " + conf2
+        + "\n\n" + (aresResult?.executive_summary || sitrep.assessment).slice(0, 280)
+        + "\n\nACTION: " + recAct.slice(0, 140) + note;
+
+    } else if (isHumint && humintEntities) {
+      // HUMINT PDF — entity tables
+      pdf = await buildKxsPdf({
+        module:       "HUMINT",
+        threat_level: humintEntities.threat_level || sitrep.risk_level,
+        commander:    cdrName,
+        unit:         cdrUnit,
+        ref_number:   humintRef,
+        entities:     humintEntities,
+        summary:      humintEntities.summary,
+        assessment:   sitrep.assessment,
+      });
+      filename = "HUMINT_" + humintRef + ".pdf";
+      caption  = "HUMINT REPORT · Ref: " + humintRef
+        + "\nRisk: " + (humintEntities.threat_level || sitrep.risk_level)
+        + " · Confidence: " + Math.round((humintEntities.confidence || 0.5) * 100) + "%"
+        + "\n\n" + humintEntities.summary.slice(0, 280)
+        + "\n\nACTION: " + sitrep.action.slice(0, 140) + note;
+
+    } else {
+      // Default SITREP PDF
+      pdf = await buildKxsPdf({
+        module:          "SITREP",
+        threat_level:    sitrep.risk_level,
+        threat_type:     intent.intent || "SITREP",
+        commander:       cdrName,
+        unit:            cdrUnit,
+        dtg:             sitrep.dtg,
+        from:            sitrep.from,
+        to:              sitrep.to,
+        subject:         sitrep.subject,
+        situation:       sitrep.situation,
+        enemy_forces:    sitrep.enemy_forces,
+        friendly_forces: sitrep.friendly_forces,
+        assessment:      sitrep.assessment,
+        action:          sitrep.action,
+        coordinating_info: sitrep.coordinating_info,
+      });
+      filename = "SITREP_" + sitrep.dtg.slice(0, 10) + "_" + sitrep.risk_level + ".pdf";
+      const humintLine = humintRef ? "\n\nHUMINT REF: " + humintRef : "";
+      caption = "SITREP " + sitrep.risk_level + " | " + sitrep.subject
+        + humintLine
+        + "\n\n" + sitrep.assessment.slice(0, 220)
+        + "\n\nACTION: " + sitrep.action.slice(0, 140) + note;
+    }
 
     // 14. Deliver PDF
     await sendPdf(chatId, pdf, filename, caption);
