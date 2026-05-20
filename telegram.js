@@ -21,6 +21,33 @@ const db = createClient(
 const TG   = "https://api.telegram.org/bot" + process.env.TELEGRAM_BOT_TOKEN;
 const QWEN = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions";
 
+// Lovable Supabase project — where sentinel-commander edge function lives
+const LOVABLE_URL = "https://cequizgvuhdrgnszjyar.supabase.co";
+const LOVABLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNlcXVpemd2dWhkcmduc3pqeWFyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY5NTc1NjQsImV4cCI6MjA5MjUzMzU2NH0.6p7kjibpP_GvMrixSTy_4B1POKrzREgIyyfstdHEysQ";
+
+// Nigeria state bounding boxes [minLng, minLat, maxLng, maxLat]
+const NGA_STATE_BBOX = {
+  "abia":        [7.01,4.72,8.05,5.87],  "adamawa":    [11.5,7.20,14.4,11.0],
+  "akwa ibom":   [7.10,4.50,8.50,6.00],  "anambra":    [6.58,5.68,7.42,6.77],
+  "bauchi":      [8.69,9.18,11.6,12.3],  "bayelsa":    [5.54,4.10,6.79,5.42],
+  "benue":       [7.38,6.10,10.0,8.65],  "borno":      [11.5,9.80,15.2,13.9],
+  "cross river": [7.85,4.28,9.73,7.18],  "delta":      [5.07,4.93,7.00,6.63],
+  "ebonyi":      [7.62,5.56,8.62,6.77],  "edo":        [5.06,5.74,6.73,7.70],
+  "ekiti":       [4.88,7.38,5.88,8.27],  "enugu":      [6.98,5.96,8.02,7.19],
+  "fct":         [6.77,8.34,7.68,9.35],  "abuja":      [6.77,8.34,7.68,9.35],
+  "gombe":       [10.0,9.10,12.4,11.5],  "imo":        [6.74,4.97,7.72,5.98],
+  "jigawa":      [8.42,11.2,10.8,13.5],  "kaduna":     [6.08,9.00,9.04,11.4],
+  "kano":        [7.68,11.1,9.51,12.8],  "katsina":    [6.60,11.7,9.47,14.0],
+  "kebbi":       [3.63,10.1,6.82,13.2],  "kogi":       [5.94,6.68,8.00,8.88],
+  "kwara":       [3.73,7.72,6.88,9.77],  "lagos":      [2.69,6.35,4.00,6.70],
+  "nasarawa":    [7.12,7.52,9.65,9.09],  "niger":      [3.28,8.00,7.17,11.3],
+  "ogun":        [2.69,6.70,4.03,7.80],  "ondo":       [4.18,5.75,6.04,7.85],
+  "osun":        [4.12,7.12,5.50,8.24],  "oyo":        [2.82,7.05,4.80,9.07],
+  "plateau":     [7.82,8.22,10.6,10.8],  "rivers":     [6.52,4.10,8.03,5.88],
+  "sokoto":      [4.10,12.4,6.84,14.2],  "taraba":     [9.17,6.45,12.8,9.55],
+  "yobe":        [10.3,10.5,15.1,13.9],  "zamfara":    [5.39,11.2,7.78,13.2],
+};
+
 const RISK_COLOR = {
   CRITICAL: "#CC0000",
   HIGH:     "#CC6600",
@@ -211,6 +238,74 @@ async function extractHumint(transcript) {
       threat_level: "MODERATE", confidence: 0.3,
     };
   }
+}
+
+async function extractSentinelParams(transcript) {
+  const sys  = "Nigerian military analyst. Extract satellite sweep parameters from the voice report. Return ONLY valid JSON.";
+  const user = [
+    "TRANSCRIPT: " + JSON.stringify(transcript),
+    "",
+    "Return ONLY valid JSON:",
+    "{",
+    "  \"location\": \"<place name>\",",
+    "  \"state\": \"<Nigerian state or empty string>\",",
+    "  \"lga\": \"<LGA name or empty string>\",",
+    "  \"threat_type\": \"ILLEGAL_MINING|ENCAMPMENT|FOREST_CLEARANCE|FLOODING|HUMAN_TRACKING\",",
+    "  \"days_back\": 30",
+    "}",
+  ].join("\n");
+
+  const raw = await qwen("qwen2.5-72b-instruct", [
+    { role: "system", content: sys  },
+    { role: "user",   content: user },
+  ], 400);
+
+  try { return safeJson(raw); }
+  catch {
+    return { location: "Nigeria", state: "", lga: "", threat_type: "ENCAMPMENT", days_back: 30 };
+  }
+}
+
+function resolveBbox(params) {
+  const key = (params.state || params.location || "").toLowerCase().trim();
+  for (const [name, bbox] of Object.entries(NGA_STATE_BBOX)) {
+    if (key.includes(name) || name.includes(key)) return bbox;
+  }
+  return [2.5, 4.0, 14.7, 14.0]; // Nigeria fallback
+}
+
+async function callSentinelCommander(params) {
+  const today   = new Date().toISOString().slice(0, 10);
+  const daysAgo = new Date(Date.now() - (params.days_back || 30) * 86400000).toISOString().slice(0, 10);
+  const bbox    = resolveBbox(params);
+
+  const payload = {
+    input_mode:   "POLYGON",
+    bbox,
+    date1:        daysAgo,
+    date2:        today,
+    threat_type:  params.threat_type || "ENCAMPMENT",
+    lga:          params.lga   || undefined,
+    state:        params.state || undefined,
+  };
+
+  const res = await fetch(LOVABLE_URL + "/functions/v1/sentinel-commander", {
+    method:  "POST",
+    headers: {
+      "Content-Type":  "application/json",
+      "Authorization": "Bearer " + LOVABLE_KEY,
+      "apikey":        LOVABLE_KEY,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) throw new Error("Sentinel error " + res.status + ": " + (await res.text()).slice(0, 200));
+  const data = await res.json();
+  if (data?.error === "MPC_UPSTREAM_UNAVAILABLE" || data?.degraded) {
+    throw new Error(data?.hint || "Microsoft Planetary Computer temporarily unavailable. Retry in 60s.");
+  }
+  if (data?.error) throw new Error(data.error);
+  return data;
 }
 
 async function makeSitrep(name, unit, transcript, intent) {
@@ -452,14 +547,46 @@ async function runPipeline(msg, senderName) {
       }
     }
 
-    // 11. SITREP generation — enrich with HUMINT entities if available
-    const sitrepIntent = humintEntities
-      ? { ...intent, humint: humintEntities }
-      : intent;
+    // 11. SENTINEL SWEEP — runs when commander requests satellite imagery
+    let sentinelResult = null;
+    const isSentinel = intent.intent === "AREA_SCAN"
+      || (Array.isArray(intent.modules) && intent.modules.includes("SENTINEL_SWEEP"));
+
+    if (isSentinel) {
+      try {
+        await sendText(chatId, "SENTINEL SWEEP initiated. Querying Planetary Computer satellite archive... ETA 30-60 seconds.");
+        const sentinelParams = await extractSentinelParams(text);
+        console.log("[SENTINEL] Params:", JSON.stringify(sentinelParams));
+        sentinelResult = await callSentinelCommander(sentinelParams);
+        const score = sentinelResult.threatScore ?? sentinelResult.results?.[0]?.threatScore ?? "N/A";
+        const sev   = sentinelResult.severity ?? sentinelResult.results?.[0]?.severity ?? "LOW";
+        await sendText(chatId, "SENTINEL COMPLETE. Threat score: " + score + " | Severity: " + sev + ". Generating SITREP...");
+        console.log("[SENTINEL] Done - score=" + score + " sev=" + sev);
+      } catch (e) {
+        console.warn("[SENTINEL] Failed:", e.message);
+        await sendText(chatId, "SENTINEL SWEEP error: " + e.message.slice(0, 160) + ". Generating text SITREP from voice report.");
+      }
+    }
+
+    // 12. SITREP generation — enrich with HUMINT and/or Sentinel data
+    const sitrepIntent = {
+      ...intent,
+      ...(humintEntities ? { humint: humintEntities } : {}),
+      ...(sentinelResult  ? { sentinel: {
+        brief:          sentinelResult.brief ?? sentinelResult.results?.[0]?.brief,
+        recommendation: sentinelResult.recommendation ?? sentinelResult.results?.[0]?.recommendation,
+        threat_score:   sentinelResult.threatScore ?? sentinelResult.results?.[0]?.threatScore,
+        severity:       sentinelResult.severity ?? sentinelResult.results?.[0]?.severity,
+        scene1_date:    sentinelResult.tiles?.scene1?.date ?? sentinelResult.results?.[0]?.tiles?.scene1?.date,
+        scene2_date:    sentinelResult.tiles?.scene2?.date ?? sentinelResult.results?.[0]?.tiles?.scene2?.date,
+        collection:     sentinelResult.collection,
+      }} : {}),
+    };
     const sitrep = await makeSitrep(cdrName, cdrUnit, text, sitrepIntent);
     if (isSos) sitrep.risk_level = "CRITICAL";
+    if (sentinelResult && sentinelResult.severity === "CRITICAL") sitrep.risk_level = "CRITICAL";
 
-    // 12. PDF build
+    // 13. PDF build
     const pdf      = await buildPdf(sitrep);
     const filename = "SITREP_" + sitrep.dtg.slice(0, 10) + "_" + sitrep.risk_level + ".pdf";
     const note     = conf < 0.75 ? " [LOW CONFIDENCE - VERIFY]" : "";
@@ -469,7 +596,7 @@ async function runPipeline(msg, senderName) {
       + "\n\n" + sitrep.assessment.slice(0, 220)
       + "\n\nACTION: " + sitrep.action.slice(0, 140) + note;
 
-    // 13. Deliver PDF
+    // 14. Deliver PDF
     await sendPdf(chatId, pdf, filename, caption);
 
     // 14. Email (optional)
