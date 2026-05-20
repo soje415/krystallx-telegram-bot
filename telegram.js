@@ -172,6 +172,47 @@ function quickSosCheck(text) {
   return SOS_PATTERNS.some((p) => p.test(text));
 }
 
+function genRefNumber() {
+  const d = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const r = Math.random().toString(36).slice(2, 6).toUpperCase();
+  return "HUMINT-" + d + "-" + r;
+}
+
+async function extractHumint(transcript) {
+  const sys = "Nigerian Army/Navy HUMINT analyst. Extract all actionable intelligence entities from field report. Return ONLY valid JSON. No markdown.";
+  const user = [
+    "TRANSCRIPT: " + JSON.stringify(transcript),
+    "",
+    "Return ONLY valid JSON:",
+    "{",
+    "  \"persons\":    [{\"name\":\"\",\"description\":\"\",\"role\":\"\",\"location\":\"\"}],",
+    "  \"locations\":  [{\"name\":\"\",\"description\":\"\",\"grid_ref\":\"\"}],",
+    "  \"vehicles\":   [{\"type\":\"\",\"identifier\":\"\",\"description\":\"\"}],",
+    "  \"groups\":     [{\"name\":\"\",\"type\":\"\",\"size\":\"\",\"location\":\"\"}],",
+    "  \"activities\": [{\"description\":\"\",\"time_ref\":\"\",\"location\":\"\"}],",
+    "  \"weapons\":    [{\"type\":\"\",\"description\":\"\"}],",
+    "  \"summary\":    \"<one sentence>\",",
+    "  \"threat_level\": \"CRITICAL|HIGH|MODERATE|LOW\",",
+    "  \"confidence\":   0.9",
+    "}",
+  ].join("\n");
+
+  const raw = await qwen("qwen2.5-72b-instruct", [
+    { role: "system", content: sys  },
+    { role: "user",   content: user },
+  ], 1000);
+
+  try { return safeJson(raw); }
+  catch {
+    return {
+      persons: [], locations: [], vehicles: [], groups: [],
+      activities: [], weapons: [],
+      summary: transcript.slice(0, 120),
+      threat_level: "MODERATE", confidence: 0.3,
+    };
+  }
+}
+
 async function makeSitrep(name, unit, transcript, intent) {
   const dtg = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 12) + "Z";
   const sys  = "AI intelligence officer for KrystallX Shield C4ISR Nigeria. Write NATO-format SITREPs. Return ONLY valid JSON. No markdown.";
@@ -382,22 +423,56 @@ async function runPipeline(msg, senderName) {
       }).eq("id", fieldReqId);
     }
 
-    // 10. SITREP generation
-    const sitrep = await makeSitrep(cdrName, cdrUnit, text, intent);
+    // 10. HUMINT extraction (runs when intent or module routing indicates intel submission)
+    let humintRef      = null;
+    let humintEntities = null;
+    const isHumint = intent.intent === "HUMINT_SUBMIT"
+      || (Array.isArray(intent.modules) && intent.modules.includes("HUMINT_SUBMIT"));
+
+    if (isHumint) {
+      humintEntities = await extractHumint(text);
+      humintRef      = genRefNumber();
+      try {
+        await db.from("raw_intelligence").insert({
+          source_id:        senderId,
+          source_name:      cdrName,
+          unit:             cdrUnit,
+          channel:          "TELEGRAM",
+          transcript:       text,
+          entities:         humintEntities,
+          ref_number:       humintRef,
+          threat_level:     humintEntities.threat_level || "MODERATE",
+          confidence:       humintEntities.confidence   || 0.5,
+          field_request_id: fieldReqId,
+        });
+        console.log("[HUMINT] Stored - " + humintRef);
+        await sendText(chatId, "HUMINT received. Ref: " + humintRef + ". Processing SITREP...");
+      } catch (e) {
+        console.warn("[HUMINT] Write failed:", e.message);
+      }
+    }
+
+    // 11. SITREP generation — enrich with HUMINT entities if available
+    const sitrepIntent = humintEntities
+      ? { ...intent, humint: humintEntities }
+      : intent;
+    const sitrep = await makeSitrep(cdrName, cdrUnit, text, sitrepIntent);
     if (isSos) sitrep.risk_level = "CRITICAL";
 
-    // 11. PDF build
+    // 12. PDF build
     const pdf      = await buildPdf(sitrep);
     const filename = "SITREP_" + sitrep.dtg.slice(0, 10) + "_" + sitrep.risk_level + ".pdf";
     const note     = conf < 0.75 ? " [LOW CONFIDENCE - VERIFY]" : "";
+    const humintLine = humintRef ? "\n\nHUMINT REF: " + humintRef : "";
     const caption  = "SITREP " + sitrep.risk_level + " | " + sitrep.subject
-      + "\n\n" + sitrep.assessment.slice(0, 250)
-      + "\n\nACTION: " + sitrep.action.slice(0, 150) + note;
+      + humintLine
+      + "\n\n" + sitrep.assessment.slice(0, 220)
+      + "\n\nACTION: " + sitrep.action.slice(0, 140) + note;
 
-    // 12. Deliver PDF
+    // 13. Deliver PDF
     await sendPdf(chatId, pdf, filename, caption);
 
-    // 13. Email (optional)
+    // 14. Email (optional)
     if (src.email && process.env.RESEND_API_KEY) {
       try {
         const mailer  = new Resend(process.env.RESEND_API_KEY);
@@ -413,7 +488,7 @@ async function runPipeline(msg, senderName) {
       } catch (e) { console.warn("[Pipeline] Email failed:", e.message); }
     }
 
-    // 14. Finalise audit log
+    // 15. Finalise audit log
     if (logId) {
       await db.from("commander_query_log").update({
         transcript:     text,
@@ -424,7 +499,7 @@ async function runPipeline(msg, senderName) {
       }).eq("id", logId);
     }
 
-    // 15. Close field_request
+    // 16. Close field_request
     if (fieldReqId) {
       await db.from("field_requests").update({
         status:     isSos ? "SOS_ACTIVE" : "DELIVERED",
