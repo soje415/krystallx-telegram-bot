@@ -322,7 +322,21 @@ async function callAnalyzeThreat(scene1Base64, scene2Base64, params, scene1Date,
 async function callSentinelCommander(params) {
   const today   = new Date().toISOString().slice(0, 10);
   const daysAgo = new Date(Date.now() - (params.days_back || 30) * 86400000).toISOString().slice(0, 10);
-  const bbox    = resolveBbox(params);
+  const rawBbox = resolveBbox(params);
+
+  // State-level bboxes are too large for useful imagery (400km+ = ~390m/pixel).
+  // Tighten to a ~55km tactical box around the center: 0.25° ≈ 28km radius.
+  // This gives ~54m/pixel at 1024px — enough detail to see structures.
+  const spanLng = rawBbox[2] - rawBbox[0];
+  const spanLat = rawBbox[3] - rawBbox[1];
+  let bbox = rawBbox;
+  if (spanLng > 0.6 || spanLat > 0.6) {
+    const cLng = (rawBbox[0] + rawBbox[2]) / 2;
+    const cLat = (rawBbox[1] + rawBbox[3]) / 2;
+    const d = 0.25;
+    bbox = [+(cLng - d).toFixed(6), +(cLat - d).toFixed(6), +(cLng + d).toFixed(6), +(cLat + d).toFixed(6)];
+    console.log("[SENTINEL] Bbox tightened to tactical 55km box:", bbox);
+  }
 
   const payload = {
     input_mode:   "POLYGON",
@@ -521,55 +535,47 @@ function buildKxsPdf(data) {
       y = secHdr("SCENE COMPARISON — T1 (BEFORE) vs T2 (AFTER)", y);
       const gap   = 10;
       const hW    = (W - 2 * M - gap) / 2;
-      const hdrH  = 19;
-      const imgH  = 270;
-      const cardH = hdrH + imgH + 10;
+      const hdrH  = 20;
+      // Cards fill the page — leave only ~120pt at bottom for caption labels
+      const imgH  = Math.floor((H - 18 - 26 - 21 - hdrH - 120) - 10);  // ≈ 628 pts
+      const cardH = hdrH + imgH + 8;
 
       const drawCard = (x, label, date, b64) => {
         fillR(x, y, hW, cardH, PANEL);
         fillR(x, y, hW, hdrH, DARK_HDR);
         doc.rect(x, y, hW, cardH).strokeColor(AMBER).lineWidth(0.8).stroke();
         doc.fillColor(AMBER).font("Helvetica-Bold").fontSize(9)
-           .text(label + " · " + (date || "").slice(0, 10), x + 7, y + 5, { lineBreak: false });
+           .text(label + " · " + (date || "").slice(0, 10), x + 7, y + 6, { lineBreak: false });
+        const imgX = x + 4;
+        const imgY = y + hdrH + 3;
+        const imgW = hW - 8;
+        const imgBoxH = imgH - 6;
         if (b64) {
           try {
-            // fit scales to fill the box while maintaining aspect ratio — no truncation
+            // cover fills the card completely — scales to fill, may crop edges of imagery
+            // This ensures no blank space regardless of MPC's returned aspect ratio
             doc.image(Buffer.from(stripDataUrl(b64), "base64"),
-                      x + 4, y + hdrH + 3, { fit: [hW - 8, imgH - 6], align: "center", valign: "center" });
-          } catch { /* keep blank panel */ }
+                      imgX, imgY, { cover: [imgW, imgBoxH], align: "center", valign: "top" });
+          } catch {
+            doc.fillColor("#808080").font("Helvetica").fontSize(8)
+               .text("(imagery unavailable)", imgX + imgW / 2 - 55, imgY + imgBoxH / 2, { lineBreak: false });
+          }
         } else {
-          doc.fillColor("#808080").font("Helvetica").fontSize(8)
-             .text("(snapshot unavailable)", x + hW / 2 - 50, y + hdrH + imgH / 2, { lineBreak: false });
+          doc.fillColor("#606060").font("Helvetica").fontSize(8)
+             .text("(no scene acquired)", imgX + imgW / 2 - 50, imgY + imgBoxH / 2, { lineBreak: false });
         }
       };
 
       drawCard(M,            "T1 BEFORE", data.scene1_date, data.t1_image);
       drawCard(M + hW + gap, "T2 AFTER",  data.scene2_date, data.t2_image);
-      y += cardH + 14;
+      y += cardH + 10;
 
-      // Observations two-column
-      const t1Obs = (data.t1_observations || []).slice(0, 5);
-      const t2Obs = (data.t2_observations || []).slice(0, 5);
-      doc.fillColor(AMBER).font("Helvetica-Bold").fontSize(9)
-         .text("T1 OBSERVATIONS", M, y, { lineBreak: false })
-         .text("T2 OBSERVATIONS", M + hW + gap, y, { lineBreak: false });
-      y += 13;
-      let ly1 = y, ly2 = y;
-      doc.font("Helvetica").fontSize(8).fillColor("#dcdcdc");
-      for (const obs of t1Obs) {
-        doc.text("• " + obs, M, ly1, { width: hW - 6 });
-        ly1 += doc.heightOfString("• " + obs, { width: hW - 6 }) + 3;
-      }
-      for (const obs of t2Obs) {
-        doc.text("• " + obs, M + hW + gap, ly2, { width: hW - 6 });
-        ly2 += doc.heightOfString("• " + obs, { width: hW - 6 }) + 3;
-      }
-      y = Math.max(ly1, ly2) + 14;
-
+      // Brief change note below cards — full observations are on page 3
       if (data.change_summary) {
-        y = secHdr("CHANGE SUMMARY", y);
-        doc.font("Helvetica").fontSize(9).fillColor("#e6e6e6")
-           .text(data.change_summary, M, y, { width: W - 2 * M });
+        doc.fillColor(AMBER).font("Helvetica-Bold").fontSize(8)
+           .text("CHANGE SUMMARY:", M, y, { lineBreak: false });
+        doc.fillColor("#dcdcdc").font("Helvetica").fontSize(8)
+           .text("  " + data.change_summary.slice(0, 240), M + 100, y, { width: W - 2 * M - 100 });
       }
 
     } else if (module === "HUMINT") {
@@ -652,7 +658,29 @@ function buildKxsPdf(data) {
       y = secHdr("INTELLIGENCE NARRATIVE", y);
       const narr = data.executive_summary || "Analysis pending.";
       doc.font("Helvetica").fontSize(9).fillColor("#e6e6e6").text(narr, M, y, { width: W - 2 * M });
-      y += doc.heightOfString(narr, { width: W - 2 * M }) + 16;
+      y += doc.heightOfString(narr, { width: W - 2 * M }) + 14;
+
+      // T1 / T2 observations two-column
+      const t1Obs = (data.t1_observations || []).slice(0, 5);
+      const t2Obs = (data.t2_observations || []).slice(0, 5);
+      if (t1Obs.length || t2Obs.length) {
+        const hW2 = (W - 2 * M - 10) / 2;
+        doc.fillColor(AMBER).font("Helvetica-Bold").fontSize(9)
+           .text("T1 OBSERVATIONS", M, y, { lineBreak: false })
+           .text("T2 OBSERVATIONS", M + hW2 + 10, y, { lineBreak: false });
+        y += 13;
+        let ly1 = y, ly2 = y;
+        doc.font("Helvetica").fontSize(8).fillColor("#dcdcdc");
+        for (const obs of t1Obs) {
+          doc.text("• " + obs, M, ly1, { width: hW2 - 5 });
+          ly1 += doc.heightOfString("• " + obs, { width: hW2 - 5 }) + 3;
+        }
+        for (const obs of t2Obs) {
+          doc.text("• " + obs, M + hW2 + 10, ly2, { width: hW2 - 5 });
+          ly2 += doc.heightOfString("• " + obs, { width: hW2 - 5 }) + 3;
+        }
+        y = Math.max(ly1, ly2) + 12;
+      }
 
       const inds = data.threat_indicators || [];
       if (inds.length) {
