@@ -107,11 +107,11 @@ async function transcribe(base64, mimeType) {
   const audioBuffer = Buffer.from(base64, "base64");
   const form        = new FormData();
   form.append("file",  new Blob([audioBuffer], { type: mimeType || "audio/ogg" }), "audio.ogg");
-  form.append("model", "whisper-1");
+  form.append("model", "whisper-large-v3");
 
-  const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+  const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
     method:  "POST",
-    headers: { "Authorization": "Bearer " + process.env.OPENAI_API_KEY },
+    headers: { "Authorization": "Bearer " + process.env.GROQ_API_KEY },
     body:    form,
   });
 
