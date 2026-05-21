@@ -22,7 +22,7 @@ const db = createClient(
 const TG   = "https://api.telegram.org/bot" + process.env.TELEGRAM_BOT_TOKEN;
 const QWEN = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions";
 
-// Lovable Supabase project — where sentinel-commander edge function lives
+// Lovable Supabase project — where sentinel-commander + analyze-threat edge functions live
 const LOVABLE_URL = "https://cequizgvuhdrgnszjyar.supabase.co";
 const LOVABLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNlcXVpemd2dWhkcmduc3pqeWFyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY5NTc1NjQsImV4cCI6MjA5MjUzMzU2NH0.6p7kjibpP_GvMrixSTy_4B1POKrzREgIyyfstdHEysQ";
 
@@ -56,16 +56,12 @@ const RISK_COLOR = {
   LOW:      "#006600",
 };
 
-// Multi-step conversation state keyed by chatId (string)
-const convState = new Map();
-
 const TIC_KEYWORDS = /\b(taking[\s_]fire|ambush(ed|ing)?|tic\b|s\.?o\.?s\b|extract|emergency|mayday|man[\s_]down|under[\s_]fire|contact[\s_]wait|troops[\s_]in[\s_]contact)\b/i;
 
 const REPORTER_TIERS    = ["Community Leader", "LGA Official", "Faith Leader", "Transport Operator", "Anonymous"];
 const REPORT_CATEGORIES = ["🔴 Active Attack — NOW", "🟠 Suspicious Movement", "🟡 Unusual Activity", "🔵 Displacement", "ℹ️ General Information"];
 const CATEGORY_CODES    = ["ACTIVE_ATTACK", "SUSPICIOUS_MOVEMENT", "UNUSUAL_ACTIVITY", "DISPLACEMENT", "GENERAL"];
 
-// Emergency keywords — false positive acceptable, missing real SOS is not
 const SOS_PATTERNS = [
   /\bambush(ed|ing)?\b/i,
   /\bunder\s+fire\b/i,
@@ -80,6 +76,64 @@ const SOS_PATTERNS = [
   /\bhelp\s+us\b/i,
   /\bwe('re|\s+are)\s+(surrounded|pinned|hit)\b/i,
 ];
+
+// Steps that belong to the onboarding flow
+const ONBOARDING_STEPS = new Set([
+  "AWAIT_ROLE", "AWAIT_NAME", "AWAIT_LGA", "AWAIT_COMMUNITY", "AWAIT_PHONE", "AWAIT_OTP",
+]);
+
+// Steps that belong to the civilian report flow
+const CIVILIAN_STEPS = new Set([
+  "AWAIT_CATEGORY", "AWAIT_LOCATION", "AWAIT_DESCRIPTION", "AWAIT_COUNT",
+]);
+
+const HELP_TEXT = [
+  "KrystallX Shield — Community Watch Network",
+  "",
+  "Commands:",
+  "/start  — Start or restart registration",
+  "/report — Submit a new security report",
+  "/help   — Show this message",
+  "",
+  "To report an incident, tap /report and follow the steps.",
+  "Your reports are reviewed by security forces.",
+].join("\n");
+
+const MILITARY_HELP = [
+  "KrystallX Shield — Military C4ISR",
+  "",
+  "Send a voice note to submit a SITREP or HUMINT report.",
+  "",
+  "Emergency keywords (text):",
+  "• ambush / taking fire / under fire",
+  "• man down / mayday / SOS",
+  "",
+  "These trigger immediate emergency protocol and Sentinel sweep.",
+].join("\n");
+
+// ================================================================
+// CONVERSATION STATE — DB-backed (survives bot restarts)
+// ================================================================
+
+async function getState(chatId) {
+  const { data } = await db
+    .from("bot_conv_state")
+    .select("step, data")
+    .eq("chat_id", String(chatId))
+    .maybeSingle();
+  return data || null;
+}
+
+async function setState(chatId, step, data = {}) {
+  await db.from("bot_conv_state").upsert(
+    { chat_id: String(chatId), step, data, updated_at: new Date().toISOString() },
+    { onConflict: "chat_id" }
+  );
+}
+
+async function clearState(chatId) {
+  await db.from("bot_conv_state").delete().eq("chat_id", String(chatId));
+}
 
 // ================================================================
 // TELEGRAM HELPERS
@@ -283,7 +337,7 @@ function resolveBbox(params) {
   for (const [name, bbox] of Object.entries(NGA_STATE_BBOX)) {
     if (key.includes(name) || name.includes(key)) return bbox;
   }
-  return [2.5, 4.0, 14.7, 14.0]; // Nigeria fallback
+  return [2.5, 4.0, 14.7, 14.0];
 }
 
 async function callAnalyzeThreat(scene1Base64, scene2Base64, params, scene1Date, scene2Date) {
@@ -291,7 +345,6 @@ async function callAnalyzeThreat(scene1Base64, scene2Base64, params, scene1Date,
   const lat  = (bbox[1] + bbox[3]) / 2;
   const lng  = (bbox[0] + bbox[2]) / 2;
 
-  // Build rich place context for higher ARES confidence
   const placeParts = [
     params.location && params.location !== params.state ? params.location : null,
     params.ward     ? "Ward: " + params.ward         : null,
@@ -334,9 +387,6 @@ async function callSentinelCommander(params) {
   const daysAgo = new Date(Date.now() - (params.days_back || 30) * 86400000).toISOString().slice(0, 10);
   const rawBbox = params.bbox || resolveBbox(params);
 
-  // State-level bboxes are too large for useful imagery (400km+ = ~390m/pixel).
-  // Tighten to a ~55km tactical box around the center: 0.25° ≈ 28km radius.
-  // This gives ~54m/pixel at 1024px — enough detail to see structures.
   const spanLng = rawBbox[2] - rawBbox[0];
   const spanLat = rawBbox[3] - rawBbox[1];
   let bbox = rawBbox;
@@ -411,7 +461,7 @@ async function makeSitrep(name, unit, transcript, intent) {
 }
 
 // ================================================================
-// UNIFIED PDF BUILDER — matches KrystallX Shield frontend visual style
+// UNIFIED PDF BUILDER
 // ================================================================
 
 function buildKxsPdf(data) {
@@ -422,17 +472,15 @@ function buildKxsPdf(data) {
     doc.on("end",   ()  => resolve(Buffer.concat(chunks)));
     doc.on("error", reject);
 
-    // A4 points: 595.28 × 841.89  |  M=40pt ≈ 14mm
     const W = 595.28, H = 841.89, M = 40;
-    const VOID_BG = "#0A0E1A";
-    const AMBER   = "#F59E0B";
-    const PANEL   = "#0F1629";
-    const RED_BAN = "#dc2626";
+    const VOID_BG  = "#0A0E1A";
+    const AMBER    = "#F59E0B";
+    const PANEL    = "#0F1629";
+    const RED_BAN  = "#dc2626";
     const DARK_HDR = "#1a2238";
     const THREAT_HEX = { CRITICAL: "#ef4444", HIGH: "#f97316", MODERATE: "#facc15", LOW: "#22c55e" };
 
     const stripDataUrl = (b64) => (b64 || "").replace(/^data:[^;]+;base64,/, "");
-
     const fillR = (x, y, w, h, hex) => { doc.save(); doc.rect(x, y, w, h).fill(hex); doc.restore(); };
 
     const classBanner = (y) => {
@@ -481,7 +529,6 @@ function buildKxsPdf(data) {
        .text(tl2, 0, 145, { align: "center", width: W, lineBreak: false });
     doc.moveTo(M, 168).lineTo(W - M, 168).strokeColor(AMBER).lineWidth(1).stroke();
 
-    // Threat level tile
     fillR(M, 180, W - 2 * M, 95, PANEL);
     doc.rect(M, 180, W - 2 * M, 95).strokeColor(tHex).lineWidth(3).stroke();
     doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(9).text("THREAT LEVEL", M + 10, 193, { lineBreak: false });
@@ -494,7 +541,6 @@ function buildKxsPdf(data) {
          .text("Confidence: " + data.analyst_confidence, W - M - 190, 228, { lineBreak: false });
     }
 
-    // Metadata table
     let cy = 295;
     const meta = module === "SENTINEL"
       ? [
@@ -546,8 +592,7 @@ function buildKxsPdf(data) {
       const gap   = 10;
       const hW    = (W - 2 * M - gap) / 2;
       const hdrH  = 20;
-      // Cards fill the page — leave only ~120pt at bottom for caption labels
-      const imgH  = Math.floor((H - 18 - 26 - 21 - hdrH - 120) - 10);  // ≈ 628 pts
+      const imgH  = Math.floor((H - 18 - 26 - 21 - hdrH - 120) - 10);
       const cardH = hdrH + imgH + 8;
 
       const drawCard = (x, label, date, b64) => {
@@ -562,8 +607,6 @@ function buildKxsPdf(data) {
         const imgBoxH = imgH - 6;
         if (b64) {
           try {
-            // cover fills the card completely — scales to fill, may crop edges of imagery
-            // This ensures no blank space regardless of MPC's returned aspect ratio
             doc.image(Buffer.from(stripDataUrl(b64), "base64"),
                       imgX, imgY, { cover: [imgW, imgBoxH], align: "center", valign: "top" });
           } catch {
@@ -580,7 +623,6 @@ function buildKxsPdf(data) {
       drawCard(M + hW + gap, "T2 AFTER",  data.scene2_date, data.t2_image);
       y += cardH + 10;
 
-      // Brief change note below cards — full observations are on page 3
       if (data.change_summary) {
         doc.fillColor(AMBER).font("Helvetica-Bold").fontSize(8)
            .text("CHANGE SUMMARY:", M, y, { lineBreak: false });
@@ -589,7 +631,7 @@ function buildKxsPdf(data) {
       }
 
     } else if (module === "HUMINT") {
-      const ent = data.entities || {};
+      const ent  = data.entities || {};
       const tblW = W - 2 * M;
       const col  = tblW / 3;
 
@@ -634,7 +676,6 @@ function buildKxsPdf(data) {
         [["NAME", col, "name"], ["DESCRIPTION", col, "description"], ["GRID REF", col, "grid_ref"]]);
 
     } else {
-      // SITREP NATO sections
       for (const [heading, body] of [
         ["1. SITUATION",       data.situation],
         ["2. ENEMY FORCES",    data.enemy_forces],
@@ -670,7 +711,6 @@ function buildKxsPdf(data) {
       doc.font("Helvetica").fontSize(9).fillColor("#e6e6e6").text(narr, M, y, { width: W - 2 * M });
       y += doc.heightOfString(narr, { width: W - 2 * M }) + 14;
 
-      // T1 / T2 observations two-column
       const t1Obs = (data.t1_observations || []).slice(0, 5);
       const t2Obs = (data.t2_observations || []).slice(0, 5);
       if (t1Obs.length || t2Obs.length) {
@@ -747,7 +787,6 @@ function buildKxsPdf(data) {
       doc.font("Helvetica").fontSize(9).fillColor("#e6e6e6").text(summary, M, y, { width: W - 2 * M });
     }
 
-    // Signature block — all modules
     if (y > H - 90) {
       doc.addPage(); fillR(0, 0, W, H, VOID_BG); classBanner(0); classBanner(H - 18); y = 40;
     }
@@ -773,7 +812,6 @@ function hashId(telegramUserId) {
   return createHash("sha256").update(String(telegramUserId)).digest("hex");
 }
 
-// Build a 1-km bounding box around a GPS coordinate
 function coordBbox(lat, lng, km = 1) {
   const d = km / 111;
   return [+(lng - d).toFixed(6), +(lat - d).toFixed(6), +(lng + d).toFixed(6), +(lat + d).toFixed(6)];
@@ -808,7 +846,6 @@ async function requestLocation(chatId, text) {
   await sendKeyboard(chatId, text, [[{ text: "📍 Share My Location", request_location: true }]]);
 }
 
-// Broadcast on Supabase Realtime from server side using REST endpoint
 async function realtimeBroadcast(channel, event, payload) {
   const url = (process.env.SUPABASE_URL || "").replace(/\/$/, "") + "/realtime/v1/api/broadcast";
   try {
@@ -824,40 +861,21 @@ async function realtimeBroadcast(channel, event, payload) {
   } catch (e) { console.warn("[Realtime] Broadcast failed:", e.message); }
 }
 
-async function sendchampSms(phone, message) {
-  // Normalize to international format — 080... → 23480...
-  const normalized = phone.replace(/\D/g, "").replace(/^0/, "234");
-  const res = await fetch("https://api.sendchamp.com/api/v1/sms/send", {
-    method: "POST",
-    headers: {
-      "Content-Type":  "application/json",
-      "Authorization": "Bearer " + process.env.SENDCHAMP_API_KEY,
-    },
-    body: JSON.stringify({
-      to:          [normalized],
-      message,
-      sender_name: process.env.SENDCHAMP_SENDER_ID || "KXShield",
-      route:       "dnd",
-    }),
-  });
-  if (!res.ok) throw new Error("Sendchamp " + res.status + ": " + (await res.text()).slice(0, 160));
-}
-
 // ================================================================
 // FEATURE 1 — TIC EMERGENCY PROTOCOL
 // ================================================================
 
 async function handleTicEmergency(msg, commanderId, commanderName) {
   const chatId = msg.chat.id;
-  const ref    = genTicRef();
   const userId = String(msg.from?.id || chatId);
+  const ref    = genTicRef();
 
-  convState.set(String(chatId), {
-    step: "TIC_AWAIT_LOCATION",
-    data: { commanderId, commanderName, ref, triggeredAt: new Date().toISOString(), rawText: msg.text || "" },
+  await setState(String(chatId), "TIC_AWAIT_LOCATION", {
+    commanderId, commanderName, ref,
+    triggeredAt: new Date().toISOString(),
+    rawText: msg.text || "",
   });
 
-  // Write to field_requests immediately — this is what fires the C2 alarm
   try {
     await db.from("field_requests").insert({
       source_id:   userId,
@@ -878,13 +896,12 @@ async function handleTicEmergency(msg, commanderId, commanderName) {
 
 async function processTicLocation(chatId, lat, lng, state) {
   const { commanderId, commanderName, ref, triggeredAt } = state.data;
-  convState.delete(String(chatId));
+  await clearState(String(chatId));
 
-  const bbox     = coordBbox(lat, lng, 1);
-  const today    = new Date().toISOString().slice(0, 10);
-  const weekAgo  = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+  const bbox    = coordBbox(lat, lng, 1);
+  const today   = new Date().toISOString().slice(0, 10);
+  const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
 
-  // Log to dispatch_log
   try {
     await db.from("dispatch_log").insert({
       status:       "TIC_EMERGENCY",
@@ -895,17 +912,14 @@ async function processTicLocation(chatId, lat, lng, state) {
     });
   } catch (e) { console.warn("[TIC] dispatch_log:", e.message); }
 
-  // RED alert to dashboard
   await realtimeBroadcast("tic_emergency", "TIC_ALERT", {
     ref, commanderId, commanderName, lat, lng, bbox, triggeredAt, message: state.data.rawText,
   });
 
-  // Immediate acknowledgement to commander
   await removeKeyboard(chatId,
     `✅ EMERGENCY LOGGED. Ref: ${ref}\nSentinel sweep launched over your position.\nC2 Center has been alerted.\nStay on this channel.`
   );
 
-  // Parallel Sentinel-2 + Sentinel-1 sweeps (fire-and-forget — reply when done)
   Promise.allSettled([
     callSentinelCommander({ bbox, days_back: 7, threat_type: "ENCAMPMENT" }),
     callSentinelCommander({ bbox, days_back: 7, threat_type: "HUMAN_TRACKING" }),
@@ -937,126 +951,106 @@ async function finalizeRegistration(chatId, userId, d) {
     await db.from("civilian_reporters").upsert({
       telegram_user_id_hash: hash,
       tier:        (d.tier || "ANONYMOUS").toUpperCase().replace(/\s+/g, "_"),
-      lga:         d.lga      || null,
+      lga:         d.lga       || null,
       community:   d.community || null,
       verified:    d.verified  || false,
       onboarded_at: new Date().toISOString(),
     }, { onConflict: "telegram_user_id_hash" });
   } catch (e) { console.warn("[CEWN] Registration:", e.message); }
-  convState.set(String(chatId), { step: "REPORT_MENU", data: {} });
+
+  // Set AWAIT_CATEGORY directly so the first tap on a category is processed immediately
+  await setState(String(chatId), "AWAIT_CATEGORY", {});
   await showReportMenu(chatId, d.verified);
 }
 
-// Civilian onboarding — unknown users
-async function handleOnboarding(msg) {
+// Civilian onboarding flow — unknown or mid-registration users
+async function handleOnboarding(msg, state) {
   const chatId = String(msg.chat.id);
   const userId = String(msg.from?.id || msg.chat.id);
   const text   = (msg.text || "").trim();
-  const state  = convState.get(chatId) || { step: "START", data: {} };
+  const step   = state?.step;
+  const data   = state?.data || {};
 
-  if (state.step === "START" || text === "/start" || !state.step) {
-    convState.set(chatId, { step: "AWAIT_ROLE", data: {} });
+  if (!step || step === "START" || text === "/start") {
+    await setState(chatId, "AWAIT_ROLE", {});
     const rows = REPORTER_TIERS.map((t, i) => [{ text: (i + 1) + ". " + t }]);
     await sendKeyboard(msg.chat.id, "Welcome to KrystallX Shield Community Watch Network.\n\nSelect your role:", rows);
     return;
   }
 
-  if (state.step === "AWAIT_ROLE") {
+  if (step === "AWAIT_ROLE") {
     const idx  = parseInt(text) - 1;
     const tier = REPORTER_TIERS[idx] ?? "Anonymous";
-    convState.set(chatId, { step: "AWAIT_NAME", data: { tier } });
+    await setState(chatId, "AWAIT_NAME", { tier });
     await sendText(msg.chat.id, "Enter your full name (or type 'skip' to stay anonymous):");
     return;
   }
 
-  if (state.step === "AWAIT_NAME") {
+  if (step === "AWAIT_NAME") {
     const name = text.toLowerCase() === "skip" ? "Anonymous" : text.slice(0, 80);
-    convState.set(chatId, { step: "AWAIT_LGA", data: { ...state.data, name } });
+    await setState(chatId, "AWAIT_LGA", { ...data, name });
     await sendText(msg.chat.id, "Enter your LGA (Local Government Area):");
     return;
   }
 
-  if (state.step === "AWAIT_LGA") {
-    convState.set(chatId, { step: "AWAIT_COMMUNITY", data: { ...state.data, lga: text.slice(0, 80) } });
+  if (step === "AWAIT_LGA") {
+    await setState(chatId, "AWAIT_COMMUNITY", { ...data, lga: text.slice(0, 80) });
     await sendText(msg.chat.id, "Enter your community or area name:");
     return;
   }
 
-  if (state.step === "AWAIT_COMMUNITY") {
-    convState.set(chatId, { step: "AWAIT_PHONE", data: { ...state.data, community: text.slice(0, 80) } });
-    await sendText(msg.chat.id, "Enter your phone number for SMS verification (e.g. 08012345678).\n\nType 'skip' to register without verification.");
+  if (step === "AWAIT_COMMUNITY") {
+    await setState(chatId, "AWAIT_PHONE", { ...data, community: text.slice(0, 80) });
+    await sendText(msg.chat.id, "Enter your phone number for verification (e.g. 08012345678), or type 'skip':");
     return;
   }
 
-  if (state.step === "AWAIT_PHONE") {
-    if (text.toLowerCase() === "skip" || state.data.tier === "Anonymous") {
-      await finalizeRegistration(msg.chat.id, userId, { ...state.data, verified: false });
-      return;
-    }
-    const phone = text.replace(/\D/g, "");
-    if (phone.length < 10) {
-      await sendText(msg.chat.id, "Invalid number. Try again or type 'skip':");
-      return;
-    }
-    const otp = String(Math.floor(100000 + Math.random() * 900000));
-    try {
-      await sendchampSms(phone, `KrystallX Shield verification code: ${otp}. Valid 10 minutes.`);
-      convState.set(chatId, { step: "AWAIT_OTP", data: { ...state.data, phone, otp, otpExpiry: Date.now() + 600000 } });
-      await sendText(msg.chat.id, "OTP sent. Enter the 6-digit code:");
-    } catch (e) {
-      console.warn("[CEWN] SMS failed:", e.message);
-      await sendText(msg.chat.id, "SMS unavailable. Type 'skip' to continue without verification:");
-    }
+  if (step === "AWAIT_PHONE") {
+    // Sendchamp disabled — treat all phone entries as skip/unverified
+    await finalizeRegistration(msg.chat.id, userId, { ...data, verified: false });
     return;
   }
 
-  if (state.step === "AWAIT_OTP") {
-    if (Date.now() > state.data.otpExpiry) {
-      convState.set(chatId, { step: "AWAIT_PHONE", data: state.data });
-      await sendText(msg.chat.id, "OTP expired. Re-enter your phone number:");
-      return;
-    }
-    if (text !== state.data.otp) {
-      await sendText(msg.chat.id, "Incorrect code. Try again:");
-      return;
-    }
-    await finalizeRegistration(msg.chat.id, userId, { ...state.data, verified: true });
+  if (step === "AWAIT_OTP") {
+    // OTP flow not active — skip to registration
+    await finalizeRegistration(msg.chat.id, userId, { ...data, verified: false });
     return;
   }
 
-  // Unknown state — restart
-  convState.delete(chatId);
-  await handleOnboarding({ ...msg, text: "/start" });
+  // Unknown step — restart
+  await clearState(chatId);
+  await handleOnboarding({ ...msg, text: "/start" }, null);
 }
 
-// Registered civilian — report flow
-async function handleCivilianMessage(msg, reporter) {
+// Registered civilian — report submission flow
+async function handleCivilianMessage(msg, reporter, state) {
   const chatId = String(msg.chat.id);
   const text   = (msg.text || "").trim();
-  const state  = convState.get(chatId) || { step: "REPORT_MENU", data: {} };
+  const step   = state?.step;
+  const data   = state?.data || {};
 
-  if (text === "/report" || state.step === "REPORT_MENU" || !state.step) {
-    convState.set(chatId, { step: "AWAIT_CATEGORY", data: {} });
+  // Explicit /report command or no active step → show category menu
+  if (text === "/report" || !step) {
+    await setState(chatId, "AWAIT_CATEGORY", {});
     await showReportMenu(msg.chat.id, reporter.verified);
     return;
   }
 
-  if (state.step === "AWAIT_CATEGORY") {
+  if (step === "AWAIT_CATEGORY") {
     const idx      = parseInt(text) - 1;
     const category = CATEGORY_CODES[idx] ?? "GENERAL";
-    convState.set(chatId, { step: "AWAIT_LOCATION", data: { category } });
+    await setState(chatId, "AWAIT_LOCATION", { category });
     await requestLocation(msg.chat.id, "📍 Where is this happening?\nShare your location or type the place name:");
     return;
   }
 
-  if (state.step === "AWAIT_LOCATION") {
-    // Text fallback for location
-    convState.set(chatId, { step: "AWAIT_DESCRIPTION", data: { ...state.data, locationText: text, coords: null } });
-    await sendText(msg.chat.id, "Describe what you saw. You can send a text message or a voice note:");
+  if (step === "AWAIT_LOCATION") {
+    await setState(chatId, "AWAIT_DESCRIPTION", { ...data, locationText: text, coords: null });
+    await sendText(msg.chat.id, "Describe what you saw. Send text or a voice note:");
     return;
   }
 
-  if (state.step === "AWAIT_DESCRIPTION") {
+  if (step === "AWAIT_DESCRIPTION") {
     let description = text;
     if (msg.voice || msg.audio) {
       try {
@@ -1072,28 +1066,33 @@ async function handleCivilianMessage(msg, reporter) {
       }
     }
     if (!description) { await sendText(msg.chat.id, "Please describe what you saw:"); return; }
-    convState.set(chatId, { step: "AWAIT_COUNT", data: { ...state.data, description } });
+    await setState(chatId, "AWAIT_COUNT", { ...data, description });
     await sendText(msg.chat.id, "How many people or vehicles? (estimate, or type 'unknown'):");
     return;
   }
 
-  if (state.step === "AWAIT_COUNT") {
-    await submitHumintReport(msg.chat.id, reporter, { ...state.data, count: text });
-    convState.set(chatId, { step: "REPORT_MENU", data: {} });
+  if (step === "AWAIT_COUNT") {
+    await submitHumintReport(msg.chat.id, reporter, { ...data, count: text });
+    // Ready for next report
+    await setState(chatId, "AWAIT_CATEGORY", {});
     return;
   }
 }
 
-async function handleCivilianLocation(msg, reporter) {
+async function handleCivilianLocation(msg, reporter, state) {
   const chatId = String(msg.chat.id);
-  const state  = convState.get(chatId) || {};
+  const step   = state?.step;
+  const data   = state?.data || {};
   const { latitude: lat, longitude: lng } = msg.location;
 
-  if (state.step === "AWAIT_LOCATION") {
-    convState.set(chatId, { step: "AWAIT_DESCRIPTION", data: { ...state.data, coords: { lat, lng }, locationText: null } });
+  if (step === "AWAIT_LOCATION") {
+    await setState(chatId, "AWAIT_DESCRIPTION", { ...data, coords: { lat, lng }, locationText: null });
     await sendText(msg.chat.id, "📍 Location captured. Describe what you saw (text or voice note):");
     return;
   }
+
+  // Location received outside expected step — show report menu
+  await setState(chatId, "AWAIT_CATEGORY", {});
   await showReportMenu(msg.chat.id, reporter.verified);
 }
 
@@ -1101,7 +1100,6 @@ async function submitHumintReport(chatId, reporter, d) {
   const ref   = genHumRef();
   const score = credibilityBase(reporter);
 
-  // Insert humint_reports
   try {
     await db.from("humint_reports").insert({
       reporter_id:       reporter.id,
@@ -1116,7 +1114,6 @@ async function submitHumintReport(chatId, reporter, d) {
     });
   } catch (e) { console.warn("[CEWN] humint_reports:", e.message); }
 
-  // Mirror into raw_intelligence for SOCMINT fusion pipeline
   try {
     await db.from("raw_intelligence").insert({
       source:       "HUMINT_CIVILIAN",
@@ -1136,7 +1133,6 @@ async function submitHumintReport(chatId, reporter, d) {
     });
   } catch (e) { console.warn("[CEWN] raw_intelligence:", e.message); }
 
-  // Increment report count
   try {
     await db.from("civilian_reporters")
       .update({ report_count: (reporter.report_count || 0) + 1 })
@@ -1170,60 +1166,77 @@ async function submitHumintReport(chatId, reporter, d) {
     } catch (e) { console.warn("[CEWN] Corroboration check:", e.message); }
   }
 
-  await removeKeyboard(chatId, `✅ Report received. Ref: ${ref}\nThank you for keeping your community safe.`);
+  await removeKeyboard(chatId, `✅ Report received. Ref: ${ref}\nThank you for keeping your community safe.\n\nSend /report to submit another.`);
 }
 
 // ================================================================
-// ROLE ROUTER — sits in front of the webhook, classifies every message
-// Military | Civilian | Onboarding
+// ROLE ROUTER
 // ================================================================
 
 async function routeMessage(msg) {
   const chatId = String(msg.chat.id);
   const userId = String(msg.from?.id || msg.chat.id);
   const text   = (msg.text || "").trim();
-  const state  = convState.get(chatId);
 
-  // /civilian test override — must be first so it clears any old state
-  if (text === "/civilian") {
-    convState.set(chatId, { step: "START", data: {} });
-    await handleOnboarding({ ...msg, text: "/start" });
+  // ── /start and /help are universal ───────────────────────────────
+  if (text === "/start") {
+    await clearState(chatId);
+    await handleOnboarding(msg, null);
     return;
   }
 
-  // ── Active conversation takes priority over role lookup ──────────
-  // Without this, a military commander in /civilian test mode gets
-  // re-routed to military flow on every message after the first.
-  // TIC_AWAIT_LOCATION is excluded — it has its own handler below.
+  if (text === "/help") {
+    // Show role-appropriate help after checking registration
+    const { data: military } = await db
+      .from("humint_sources")
+      .select("active")
+      .eq("telegram_user_id", userId)
+      .maybeSingle();
+    await sendText(chatId, military?.active ? MILITARY_HELP : HELP_TEXT);
+    return;
+  }
+
+  // ── Fetch current conversation state ─────────────────────────────
+  const state    = await getState(chatId);
   const activeStep = state?.step;
-  if (activeStep && activeStep !== "TIC_AWAIT_LOCATION") {
+
+  // ── Active onboarding conversation ───────────────────────────────
+  if (activeStep && ONBOARDING_STEPS.has(activeStep)) {
+    await handleOnboarding(msg, state);
+    return;
+  }
+
+  // ── Active civilian report conversation ──────────────────────────
+  if (activeStep && CIVILIAN_STEPS.has(activeStep)) {
     const hash = hashId(userId);
     const { data: reporter } = await db
       .from("civilian_reporters")
       .select("*")
       .eq("telegram_user_id_hash", hash)
-      .single();
+      .maybeSingle();
     if (reporter) {
-      if (msg.location) await handleCivilianLocation(msg, reporter);
-      else              await handleCivilianMessage(msg, reporter);
+      if (msg.location) await handleCivilianLocation(msg, reporter, state);
+      else              await handleCivilianMessage(msg, reporter, state);
     } else {
-      await handleOnboarding(msg);
+      // State exists but no DB record — restart onboarding
+      await clearState(chatId);
+      await handleOnboarding(msg, null);
     }
     return;
   }
 
-  // ── MILITARY: match on humint_sources ────────────────────────────
+  // ── Check military registration ───────────────────────────────────
   const { data: military } = await db
     .from("humint_sources")
     .select("id, display_name, rank, unit, active")
     .eq("telegram_user_id", userId)
-    .single();
+    .maybeSingle();
 
   if (military?.active) {
     const name = ((military.rank || "") + " " + military.display_name).trim();
 
-    // Pending TIC location — location message or text fallback
-    if (state?.step === "TIC_AWAIT_LOCATION") {
+    // Pending TIC location
+    if (activeStep === "TIC_AWAIT_LOCATION") {
       if (msg.location) {
         await processTicLocation(msg.chat.id, msg.location.latitude, msg.location.longitude, state);
       } else if (text) {
@@ -1235,39 +1248,45 @@ async function routeMessage(msg) {
       return;
     }
 
-    // TIC keyword on any text message
+    // TIC keyword
     if (text && TIC_KEYWORDS.test(text)) {
       await handleTicEmergency(msg, military.id, name);
       return;
     }
 
-    // Voice / audio → existing full SITREP pipeline
+    // Voice / audio → SITREP pipeline
     if (msg.voice || msg.audio) {
       runPipeline(msg, name).catch((e) => console.error("[Router] Military pipeline:", e.message));
+      return;
+    }
+
+    // Plain text — give guidance
+    if (text) {
+      await sendText(chatId, MILITARY_HELP);
     }
     return;
   }
 
-  // ── CIVILIAN: registered reporter ────────────────────────────────
+  // ── Check civilian registration ───────────────────────────────────
   const hash = hashId(userId);
   const { data: reporter } = await db
     .from("civilian_reporters")
     .select("*")
     .eq("telegram_user_id_hash", hash)
-    .single();
+    .maybeSingle();
 
   if (reporter) {
-    if (msg.location) await handleCivilianLocation(msg, reporter);
-    else              await handleCivilianMessage(msg, reporter);
+    if (msg.location) await handleCivilianLocation(msg, reporter, state);
+    else              await handleCivilianMessage(msg, reporter, state);
     return;
   }
 
-  // ── ONBOARDING: unknown user ─────────────────────────────────────
-  await handleOnboarding(msg);
+  // ── Unknown user → onboarding ─────────────────────────────────────
+  await handleOnboarding(msg, state);
 }
 
 // ================================================================
-// PIPELINE
+// MILITARY PIPELINE — voice SITREP / HUMINT
 // ================================================================
 
 async function runPipeline(msg, senderName) {
@@ -1276,12 +1295,11 @@ async function runPipeline(msg, senderName) {
   const fileId   = msg.voice?.file_id || msg.audio?.file_id || "";
   const mimeType = msg.voice?.mime_type || msg.audio?.mime_type || "audio/ogg";
 
-  // 1. Security gate — silent block for unregistered senders
   const { data: src } = await db
     .from("humint_sources")
     .select("id, display_name, rank, unit, email, active")
     .eq("telegram_user_id", senderId)
-    .single();
+    .maybeSingle();
 
   if (!src || !src.active) {
     console.warn("[Pipeline] Unregistered: " + senderId + " (" + senderName + ")");
@@ -1299,7 +1317,6 @@ async function runPipeline(msg, senderName) {
   const cdrName = ((src.rank || "") + " " + src.display_name).trim();
   const cdrUnit = src.unit || "UNKNOWN UNIT";
 
-  // 2. Audit log entry
   const { data: logRow } = await db
     .from("commander_query_log")
     .insert({
@@ -1316,18 +1333,13 @@ async function runPipeline(msg, senderName) {
   await sendText(chatId, "Voice note received. Analysing report from " + cdrName + "... SITREP incoming.");
 
   try {
-    // 3. Download audio
     const filePath                 = await getFilePath(fileId);
     const { base64, mimeType: dm } = await downloadAudio(filePath, mimeType);
-
-    // 4. Transcribe
-    const { text, conf } = await transcribe(base64, dm);
+    const { text, conf }           = await transcribe(base64, dm);
     console.log("[Pipeline] Transcript conf=" + conf + " | " + text.slice(0, 80));
 
-    // 5. SOS CHECK — fires before any other step (LIFE-SAFETY FIRST)
     const fastSos = quickSosCheck(text);
 
-    // 6. Write field_request immediately for C2 visibility (Realtime notifies dashboard)
     let fieldReqId = null;
     try {
       const { data: fr, error: frErr } = await db
@@ -1349,20 +1361,15 @@ async function runPipeline(msg, senderName) {
       else fieldReqId = fr?.id;
     } catch (e) { console.warn("[FieldReq] Insert threw:", e.message); }
 
-    // 7. SOS immediate response — reply before SITREP pipeline completes
     if (fastSos) {
       await sendText(chatId, "EMERGENCY ACKNOWLEDGED. C2 notified. Stay on comms.");
       console.warn("[SOS] EMERGENCY DETECTED - " + cdrName + " | " + text.slice(0, 120));
     }
 
-    // 8. Intent extraction (parallel with SOS — both use transcript)
     const intent = await extractIntent(text);
     console.log("[Pipeline] Intent: " + intent.intent + " | SOS: " + (intent.is_sos || fastSos));
-
-    // Confirm and consolidate SOS flag
     const isSos = fastSos || Boolean(intent.is_sos) || intent.intent === "EMERGENCY_SOS";
 
-    // 9. Update field_request with intent data
     if (fieldReqId) {
       await db.from("field_requests").update({
         intent:         intent.intent,
@@ -1374,7 +1381,6 @@ async function runPipeline(msg, senderName) {
       }).eq("id", fieldReqId);
     }
 
-    // 10. HUMINT extraction (runs when intent or module routing indicates intel submission)
     let humintRef      = null;
     let humintEntities = null;
     const isHumint = intent.intent === "HUMINT_SUBMIT"
@@ -1398,12 +1404,9 @@ async function runPipeline(msg, senderName) {
         });
         console.log("[HUMINT] Stored - " + humintRef);
         await sendText(chatId, "HUMINT received. Ref: " + humintRef + ". Processing SITREP...");
-      } catch (e) {
-        console.warn("[HUMINT] Write failed:", e.message);
-      }
+      } catch (e) { console.warn("[HUMINT] Write failed:", e.message); }
     }
 
-    // 11. SENTINEL SWEEP — MPC raster fetch → ARES vision analysis
     let sentinelResult = null;
     let aresResult     = null;
     let sentinelParams = null;
@@ -1413,11 +1416,10 @@ async function runPipeline(msg, senderName) {
     if (isSentinel) {
       try {
         await sendText(chatId, "SENTINEL SWEEP initiated. Querying Planetary Computer satellite archive... ETA 30-60 seconds.");
-        sentinelParams  = await extractSentinelParams(text);
+        sentinelParams = await extractSentinelParams(text);
         console.log("[SENTINEL] Params:", JSON.stringify(sentinelParams));
-        sentinelResult  = await callSentinelCommander(sentinelParams);
+        sentinelResult = await callSentinelCommander(sentinelParams);
 
-        // Extract raster crops from MPC response
         const scene1  = sentinelResult.tiles?.scene1 || sentinelResult.results?.[0]?.tiles?.scene1;
         const scene2  = sentinelResult.tiles?.scene2 || sentinelResult.results?.[0]?.tiles?.scene2;
         const s1b64   = scene1?.crop_base64;
@@ -1428,20 +1430,18 @@ async function runPipeline(msg, senderName) {
         if (s1b64 && s2b64) {
           await sendText(chatId, "Raster imagery acquired. Running ARES change-detection analysis...");
           aresResult = await callAnalyzeThreat(s1b64, s2b64, sentinelParams, s1date, s2date);
-          // Attach dates and images back for PDF builder
-          aresResult._t1_image  = s1b64;
-          aresResult._t2_image  = s2b64;
-          aresResult._s1date    = s1date;
-          aresResult._s2date    = s2date;
+          aresResult._t1_image = s1b64;
+          aresResult._t2_image = s2b64;
+          aresResult._s1date   = s1date;
+          aresResult._s2date   = s2date;
           const mag  = aresResult.change_magnitude || "MODERATE";
-          const conf = aresResult.analyst_confidence || "MEDIUM";
-          await sendText(chatId, "ARES COMPLETE. Change magnitude: " + mag + " | Confidence: " + conf + ". Building SITREP...");
-          console.log("[ARES] Done - mag=" + mag + " conf=" + conf);
+          const conf2 = aresResult.analyst_confidence || "MEDIUM";
+          await sendText(chatId, "ARES COMPLETE. Change magnitude: " + mag + " | Confidence: " + conf2 + ". Building SITREP...");
+          console.log("[ARES] Done - mag=" + mag + " conf=" + conf2);
         } else {
           const score = sentinelResult.threatScore ?? sentinelResult.results?.[0]?.threatScore ?? "N/A";
           const sev   = sentinelResult.severity ?? sentinelResult.results?.[0]?.severity ?? "LOW";
-          await sendText(chatId, "SENTINEL COMPLETE (no raster crops available). Score: " + score + " | " + sev + ". Generating text SITREP...");
-          console.log("[SENTINEL] Fallback - score=" + score + " sev=" + sev);
+          await sendText(chatId, "SENTINEL COMPLETE (no raster crops). Score: " + score + " | " + sev + ". Generating text SITREP...");
         }
       } catch (e) {
         console.warn("[SENTINEL] Failed:", e.message);
@@ -1449,12 +1449,11 @@ async function runPipeline(msg, senderName) {
       }
     }
 
-    // 12. SITREP generation — enrich with HUMINT and/or Sentinel/ARES data
     const aresIntel = aresResult ? {
-      executive_summary: aresResult.executive_summary,
-      change_magnitude:  aresResult.change_magnitude,
-      analyst_confidence: aresResult.analyst_confidence,
-      threat_indicators: aresResult.threat_indicators,
+      executive_summary:   aresResult.executive_summary,
+      change_magnitude:    aresResult.change_magnitude,
+      analyst_confidence:  aresResult.analyst_confidence,
+      threat_indicators:   aresResult.threat_indicators,
       recommended_actions: aresResult.recommended_actions,
     } : null;
 
@@ -1463,21 +1462,19 @@ async function runPipeline(msg, senderName) {
       ...(humintEntities ? { humint: humintEntities } : {}),
       ...(aresIntel      ? { sentinel: aresIntel }    : {}),
       ...(sentinelResult && !aresIntel ? { sentinel: {
-        brief:       sentinelResult.brief ?? sentinelResult.results?.[0]?.brief,
+        brief:        sentinelResult.brief ?? sentinelResult.results?.[0]?.brief,
         threat_score: sentinelResult.threatScore ?? sentinelResult.results?.[0]?.threatScore,
-        severity:    sentinelResult.severity ?? sentinelResult.results?.[0]?.severity,
+        severity:     sentinelResult.severity ?? sentinelResult.results?.[0]?.severity,
       }} : {}),
     };
     const sitrep = await makeSitrep(cdrName, cdrUnit, text, sitrepIntent);
     if (isSos) sitrep.risk_level = "CRITICAL";
     if (aresResult?.change_magnitude === "CRITICAL") sitrep.risk_level = "CRITICAL";
 
-    // 13. PDF build — unified KXS dark-theme format
     let pdf, filename, caption;
     const note = conf < 0.75 ? " [LOW CONFIDENCE - VERIFY]" : "";
 
     if (isSentinel && (aresResult || sentinelResult)) {
-      // SENTINEL PDF — dark cover + T1/T2 imagery + ARES intel
       const bbox = resolveBbox(sentinelParams || {});
       pdf = await buildKxsPdf({
         module:             "SENTINEL",
@@ -1503,7 +1500,7 @@ async function runPipeline(msg, senderName) {
         unit:               cdrUnit,
       });
       filename = "SENTINEL_" + new Date().toISOString().slice(0, 10) + "_" + (aresResult?.change_magnitude || sitrep.risk_level) + ".pdf";
-      const mag  = aresResult?.change_magnitude || "N/A";
+      const mag   = aresResult?.change_magnitude || "N/A";
       const conf2 = aresResult?.analyst_confidence || "MEDIUM";
       const recAct = (aresResult?.recommended_actions || [sitrep.action])[0] || "";
       caption = "SENTINEL REPORT · " + (sentinelParams?.location || sentinelParams?.state || "Nigeria")
@@ -1512,7 +1509,6 @@ async function runPipeline(msg, senderName) {
         + "\n\nACTION: " + recAct.slice(0, 140) + note;
 
     } else if (isHumint && humintEntities) {
-      // HUMINT PDF — entity tables
       pdf = await buildKxsPdf({
         module:       "HUMINT",
         threat_level: humintEntities.threat_level || sitrep.risk_level,
@@ -1531,7 +1527,6 @@ async function runPipeline(msg, senderName) {
         + "\n\nACTION: " + sitrep.action.slice(0, 140) + note;
 
     } else {
-      // Default SITREP PDF
       pdf = await buildKxsPdf({
         module:          "SITREP",
         threat_level:    sitrep.risk_level,
@@ -1557,10 +1552,8 @@ async function runPipeline(msg, senderName) {
         + "\n\nACTION: " + sitrep.action.slice(0, 140) + note;
     }
 
-    // 14. Deliver PDF
     await sendPdf(chatId, pdf, filename, caption);
 
-    // 14. Email (optional)
     if (src.email && process.env.RESEND_API_KEY) {
       try {
         const mailer  = new Resend(process.env.RESEND_API_KEY);
@@ -1576,7 +1569,6 @@ async function runPipeline(msg, senderName) {
       } catch (e) { console.warn("[Pipeline] Email failed:", e.message); }
     }
 
-    // 15. Finalise audit log
     if (logId) {
       await db.from("commander_query_log").update({
         transcript:     text,
@@ -1587,7 +1579,6 @@ async function runPipeline(msg, senderName) {
       }).eq("id", logId);
     }
 
-    // 16. Close field_request
     if (fieldReqId) {
       await db.from("field_requests").update({
         status:     isSos ? "SOS_ACTIVE" : "DELIVERED",
@@ -1630,7 +1621,6 @@ app.post("/webhook/telegram", (req, res) => {
   res.sendStatus(200);
   const msg = req.body?.message;
   if (!msg) return;
-  // Role router handles military / civilian / onboarding for all message types
   routeMessage(msg).catch((e) => console.error("[Webhook] Unhandled:", e.message));
 });
 
@@ -1643,15 +1633,37 @@ app.get("/webhook/telegram/info", async (_req, res) => {
   }
 });
 
+// Convenience endpoint — call after deploy to register the webhook
+app.post("/setup/webhook", async (req, res) => {
+  const baseUrl = req.body?.base_url;
+  if (!baseUrl) {
+    res.status(400).json({ error: "body must include base_url e.g. https://your-app.railway.app" });
+    return;
+  }
+  const webhookUrl = baseUrl.replace(/\/$/, "") + "/webhook/telegram";
+  const secret     = process.env.TELEGRAM_SECRET_TOKEN || undefined;
+  try {
+    const r    = await fetch(TG + "/setWebhook", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ url: webhookUrl, ...(secret ? { secret_token: secret } : {}) }),
+    });
+    const data = await r.json();
+    res.json({ webhook_url: webhookUrl, telegram_response: data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ================================================================
 // START
 // ================================================================
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log("[KXS Telegram Bot] Live on port " + PORT);
-  console.log("[KXS] Bot token set: " + Boolean(process.env.TELEGRAM_BOT_TOKEN));
-  console.log("[KXS] Supabase:      " + (process.env.SUPABASE_URL || "NOT SET"));
-  console.log("[KXS] Qwen:          " + Boolean(process.env.QWEN_API_KEY));
-  console.log("[KXS] Groq:          " + Boolean(process.env.GROQ_API_KEY));
+  console.log("[KXS Bot] Listening on port " + PORT);
+  console.log("[KXS Bot] Supabase: " + (process.env.SUPABASE_URL || "NOT SET"));
+  console.log("[KXS Bot] Telegram token: " + (process.env.TELEGRAM_BOT_TOKEN ? "SET" : "NOT SET"));
+  console.log("[KXS Bot] Qwen key: " + (process.env.QWEN_API_KEY ? "SET" : "NOT SET"));
+  console.log("[KXS Bot] Groq key: " + (process.env.GROQ_API_KEY ? "SET" : "NOT SET"));
 });
