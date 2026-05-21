@@ -850,10 +850,28 @@ async function sendchampSms(phone, message) {
 async function handleTicEmergency(msg, commanderId, commanderName) {
   const chatId = msg.chat.id;
   const ref    = genTicRef();
+  const userId = String(msg.from?.id || chatId);
+
   convState.set(String(chatId), {
     step: "TIC_AWAIT_LOCATION",
     data: { commanderId, commanderName, ref, triggeredAt: new Date().toISOString(), rawText: msg.text || "" },
   });
+
+  // Write to field_requests immediately — this is what fires the C2 alarm
+  try {
+    await db.from("field_requests").insert({
+      source_id:   userId,
+      source_name: commanderName,
+      channel:     "TELEGRAM",
+      transcript:  (msg.text || "") + " [TIC — awaiting location]",
+      status:      "SOS_ACTIVE",
+      is_sos:      true,
+      risk_level:  "CRITICAL",
+      intent:      "TIC_EMERGENCY",
+      summary:     ref + " — " + commanderName + " declared TIC. Location pending.",
+    });
+  } catch (e) { console.warn("[TIC] field_requests insert:", e.message); }
+
   await requestLocation(chatId, "🔴 EMERGENCY RECEIVED. Share your live location now.");
   console.warn("[TIC] Emergency — " + commanderName + " | " + ref);
 }
@@ -1172,6 +1190,13 @@ async function routeMessage(msg) {
     .select("id, display_name, rank, unit, active")
     .eq("telegram_user_id", userId)
     .single();
+
+  // /civilian lets a registered commander test the CEWN flow directly
+  if (text === "/civilian") {
+    convState.set(chatId, { step: "START", data: {} });
+    await handleOnboarding({ ...msg, text: "/start" });
+    return;
+  }
 
   if (military?.active) {
     const name = ((military.rank || "") + " " + military.display_name).trim();
