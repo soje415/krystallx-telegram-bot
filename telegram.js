@@ -1184,29 +1184,49 @@ async function routeMessage(msg) {
   const text   = (msg.text || "").trim();
   const state  = convState.get(chatId);
 
-  // ── MILITARY: match on humint_sources (existing table) ──────────
-  const { data: military } = await db
-    .from("humint_sources")
-    .select("id, display_name, rank, unit, active")
-    .eq("telegram_user_id", userId)
-    .single();
-
-  // /civilian lets a registered commander test the CEWN flow directly
+  // /civilian test override — must be first so it clears any old state
   if (text === "/civilian") {
     convState.set(chatId, { step: "START", data: {} });
     await handleOnboarding({ ...msg, text: "/start" });
     return;
   }
 
+  // ── Active conversation takes priority over role lookup ──────────
+  // Without this, a military commander in /civilian test mode gets
+  // re-routed to military flow on every message after the first.
+  // TIC_AWAIT_LOCATION is excluded — it has its own handler below.
+  const activeStep = state?.step;
+  if (activeStep && activeStep !== "TIC_AWAIT_LOCATION") {
+    const hash = hashId(userId);
+    const { data: reporter } = await db
+      .from("civilian_reporters")
+      .select("*")
+      .eq("telegram_user_id_hash", hash)
+      .single();
+    if (reporter) {
+      if (msg.location) await handleCivilianLocation(msg, reporter);
+      else              await handleCivilianMessage(msg, reporter);
+    } else {
+      await handleOnboarding(msg);
+    }
+    return;
+  }
+
+  // ── MILITARY: match on humint_sources ────────────────────────────
+  const { data: military } = await db
+    .from("humint_sources")
+    .select("id, display_name, rank, unit, active")
+    .eq("telegram_user_id", userId)
+    .single();
+
   if (military?.active) {
     const name = ((military.rank || "") + " " + military.display_name).trim();
 
-    // Pending TIC location response — location message or text fallback
+    // Pending TIC location — location message or text fallback
     if (state?.step === "TIC_AWAIT_LOCATION") {
       if (msg.location) {
         await processTicLocation(msg.chat.id, msg.location.latitude, msg.location.longitude, state);
       } else if (text) {
-        // Text fallback — resolve via state bbox centre
         const bbox = resolveBbox({ location: text, state: text });
         const lat  = (bbox[1] + bbox[3]) / 2;
         const lng  = (bbox[0] + bbox[2]) / 2;
@@ -1228,7 +1248,7 @@ async function routeMessage(msg) {
     return;
   }
 
-  // ── CIVILIAN: match on hashed telegram_user_id ──────────────────
+  // ── CIVILIAN: registered reporter ────────────────────────────────
   const hash = hashId(userId);
   const { data: reporter } = await db
     .from("civilian_reporters")
@@ -1237,11 +1257,8 @@ async function routeMessage(msg) {
     .single();
 
   if (reporter) {
-    if (msg.location) {
-      await handleCivilianLocation(msg, reporter);
-    } else {
-      await handleCivilianMessage(msg, reporter);
-    }
+    if (msg.location) await handleCivilianLocation(msg, reporter);
+    else              await handleCivilianMessage(msg, reporter);
     return;
   }
 
