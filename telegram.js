@@ -28,6 +28,7 @@ const LOVABLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS
 
 // Nigeria state bounding boxes [minLng, minLat, maxLng, maxLat]
 const NGA_STATE_BBOX = {
+  // ── Nigerian states ───────────────────────────────────────────
   "abia":        [7.01,4.72,8.05,5.87],  "adamawa":    [11.5,7.20,14.4,11.0],
   "akwa ibom":   [7.10,4.50,8.50,6.00],  "anambra":    [6.58,5.68,7.42,6.77],
   "bauchi":      [8.69,9.18,11.6,12.3],  "bayelsa":    [5.54,4.10,6.79,5.42],
@@ -47,6 +48,19 @@ const NGA_STATE_BBOX = {
   "plateau":     [7.82,8.22,10.6,10.8],  "rivers":     [6.52,4.10,8.03,5.88],
   "sokoto":      [4.10,12.4,6.84,14.2],  "taraba":     [9.17,6.45,12.8,9.55],
   "yobe":        [10.3,10.5,15.1,13.9],  "zamfara":    [5.39,11.2,7.78,13.2],
+  // ── Nigerian maritime zones (offshore — sea-only bboxes) ──────
+  "gulf of guinea":     [2.50, 1.00, 9.00, 5.00],  // full Nigerian coastal waters
+  "nigerian waters":    [2.50, 1.00, 9.00, 5.00],
+  "nigerian eez":       [2.50,-0.50, 9.50, 4.50],  // exclusive economic zone offshore
+  "bight of benin":     [0.00, 1.00, 5.50, 6.50],  // west — Benin/Lagos offshore
+  "bight of bonny":     [5.50, 1.00,10.00, 5.50],  // east — Rivers/AkwaIbom offshore
+  "niger delta offshore":[4.50,2.50, 7.50, 5.00],
+  "niger delta":        [4.50,3.50, 7.50, 6.00],   // mixed coastal + offshore
+  "apapa":              [3.20,6.35, 3.50, 6.50],   // Lagos port approaches
+  "bonny":              [7.10,4.30, 7.30, 4.50],
+  "forcados":           [5.30,4.80, 5.60, 5.10],
+  "escravos":           [5.10,5.40, 5.40, 5.60],
+  "warri":              [5.40,5.40, 5.70, 5.70],
 };
 
 const RISK_COLOR = {
@@ -305,18 +319,19 @@ async function extractHumint(transcript) {
 }
 
 async function extractSentinelParams(transcript) {
-  const sys  = "Nigerian military analyst. Extract satellite sweep parameters from the voice report. Return ONLY valid JSON.";
+  const sys  = "Nigerian Navy/Army C4ISR analyst. Extract satellite sweep parameters from the voice report. For maritime areas (gulf, sea, ocean, offshore, waters, bight, EEZ, delta offshore, vessel positions) use the exact maritime zone name. Return ONLY valid JSON.";
   const user = [
     "TRANSCRIPT: " + JSON.stringify(transcript),
     "",
     "Return ONLY valid JSON:",
     "{",
-    "  \"location\": \"<most specific place name mentioned>\",",
-    "  \"state\": \"<Nigerian state name or empty string>\",",
+    "  \"location\": \"<most specific place name — for sea areas use: gulf of guinea | bight of benin | bight of bonny | nigerian eez | niger delta offshore | bonny | forcados | escravos>\",",
+    "  \"state\": \"<Nigerian state name, or empty string if maritime>\",",
     "  \"lga\": \"<Local Government Area or empty string>\",",
     "  \"ward\": \"<ward name if mentioned, else empty string>\",",
     "  \"district\": \"<district or area name if mentioned, else empty string>\",",
-    "  \"threat_type\": \"ILLEGAL_MINING|ENCAMPMENT|FOREST_CLEARANCE|FLOODING|HUMAN_TRACKING\",",
+    "  \"is_maritime\": false,",
+    "  \"threat_type\": \"ILLEGAL_MINING|ENCAMPMENT|FOREST_CLEARANCE|FLOODING|HUMAN_TRACKING|VESSEL_ACTIVITY\",",
     "  \"days_back\": 30",
     "}",
   ].join("\n");
