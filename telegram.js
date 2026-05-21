@@ -2,6 +2,7 @@ import express from "express";
 import { createRequire } from "module";
 import { createClient } from "@supabase/supabase-js";
 import { Resend } from "resend";
+import { createHash } from "crypto";
 
 const require = createRequire(import.meta.url);
 const PDFDocument = require("pdfkit");
@@ -54,6 +55,15 @@ const RISK_COLOR = {
   MODERATE: "#CCAA00",
   LOW:      "#006600",
 };
+
+// Multi-step conversation state keyed by chatId (string)
+const convState = new Map();
+
+const TIC_KEYWORDS = /\b(taking[\s_]fire|ambush(ed|ing)?|tic\b|s\.?o\.?s\b|extract|emergency|mayday|man[\s_]down|under[\s_]fire|contact[\s_]wait|troops[\s_]in[\s_]contact)\b/i;
+
+const REPORTER_TIERS    = ["Community Leader", "LGA Official", "Faith Leader", "Transport Operator", "Anonymous"];
+const REPORT_CATEGORIES = ["🔴 Active Attack — NOW", "🟠 Suspicious Movement", "🟡 Unusual Activity", "🔵 Displacement", "ℹ️ General Information"];
+const CATEGORY_CODES    = ["ACTIVE_ATTACK", "SUSPICIOUS_MOVEMENT", "UNUSUAL_ACTIVITY", "DISPLACEMENT", "GENERAL"];
 
 // Emergency keywords — false positive acceptable, missing real SOS is not
 const SOS_PATTERNS = [
@@ -322,7 +332,7 @@ async function callAnalyzeThreat(scene1Base64, scene2Base64, params, scene1Date,
 async function callSentinelCommander(params) {
   const today   = new Date().toISOString().slice(0, 10);
   const daysAgo = new Date(Date.now() - (params.days_back || 30) * 86400000).toISOString().slice(0, 10);
-  const rawBbox = resolveBbox(params);
+  const rawBbox = params.bbox || resolveBbox(params);
 
   // State-level bboxes are too large for useful imagery (400km+ = ~390m/pixel).
   // Tighten to a ~55km tactical box around the center: 0.25° ≈ 28km radius.
@@ -756,6 +766,465 @@ function buildKxsPdf(data) {
 }
 
 // ================================================================
+// SHARED BOT UI HELPERS
+// ================================================================
+
+function hashId(telegramUserId) {
+  return createHash("sha256").update(String(telegramUserId)).digest("hex");
+}
+
+// Build a 1-km bounding box around a GPS coordinate
+function coordBbox(lat, lng, km = 1) {
+  const d = km / 111;
+  return [+(lng - d).toFixed(6), +(lat - d).toFixed(6), +(lng + d).toFixed(6), +(lat + d).toFixed(6)];
+}
+
+function genTicRef() { return "TIC-" + Date.now(); }
+function genHumRef() { return "HUM-" + Date.now(); }
+
+async function sendKeyboard(chatId, text, rows) {
+  await fetch(TG + "/sendMessage", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId, text,
+      reply_markup: { keyboard: rows, one_time_keyboard: true, resize_keyboard: true },
+    }),
+  });
+}
+
+async function removeKeyboard(chatId, text) {
+  await fetch(TG + "/sendMessage", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId, text,
+      reply_markup: { remove_keyboard: true },
+    }),
+  });
+}
+
+async function requestLocation(chatId, text) {
+  await sendKeyboard(chatId, text, [[{ text: "📍 Share My Location", request_location: true }]]);
+}
+
+// Broadcast on Supabase Realtime from server side using REST endpoint
+async function realtimeBroadcast(channel, event, payload) {
+  const url = (process.env.SUPABASE_URL || "").replace(/\/$/, "") + "/realtime/v1/api/broadcast";
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "Authorization": "Bearer " + process.env.SUPABASE_SERVICE_ROLE_KEY,
+        "apikey":        process.env.SUPABASE_SERVICE_ROLE_KEY,
+      },
+      body: JSON.stringify({ messages: [{ topic: "realtime:" + channel, event, payload }] }),
+    });
+  } catch (e) { console.warn("[Realtime] Broadcast failed:", e.message); }
+}
+
+async function sendchampSms(phone, message) {
+  // Normalize to international format — 080... → 23480...
+  const normalized = phone.replace(/\D/g, "").replace(/^0/, "234");
+  const res = await fetch("https://api.sendchamp.com/api/v1/sms/send", {
+    method: "POST",
+    headers: {
+      "Content-Type":  "application/json",
+      "Authorization": "Bearer " + process.env.SENDCHAMP_API_KEY,
+    },
+    body: JSON.stringify({
+      to:          [normalized],
+      message,
+      sender_name: process.env.SENDCHAMP_SENDER_ID || "KXShield",
+      route:       "dnd",
+    }),
+  });
+  if (!res.ok) throw new Error("Sendchamp " + res.status + ": " + (await res.text()).slice(0, 160));
+}
+
+// ================================================================
+// FEATURE 1 — TIC EMERGENCY PROTOCOL
+// ================================================================
+
+async function handleTicEmergency(msg, commanderId, commanderName) {
+  const chatId = msg.chat.id;
+  const ref    = genTicRef();
+  convState.set(String(chatId), {
+    step: "TIC_AWAIT_LOCATION",
+    data: { commanderId, commanderName, ref, triggeredAt: new Date().toISOString(), rawText: msg.text || "" },
+  });
+  await requestLocation(chatId, "🔴 EMERGENCY RECEIVED. Share your live location now.");
+  console.warn("[TIC] Emergency — " + commanderName + " | " + ref);
+}
+
+async function processTicLocation(chatId, lat, lng, state) {
+  const { commanderId, commanderName, ref, triggeredAt } = state.data;
+  convState.delete(String(chatId));
+
+  const bbox     = coordBbox(lat, lng, 1);
+  const today    = new Date().toISOString().slice(0, 10);
+  const weekAgo  = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+
+  // Log to dispatch_log
+  try {
+    await db.from("dispatch_log").insert({
+      status:       "TIC_EMERGENCY",
+      commander_id: commanderId,
+      coordinates:  `(${lng},${lat})`,
+      triggered_at: triggeredAt,
+      notes:        ref + " | " + (state.data.rawText || "").slice(0, 200),
+    });
+  } catch (e) { console.warn("[TIC] dispatch_log:", e.message); }
+
+  // RED alert to dashboard
+  await realtimeBroadcast("tic_emergency", "TIC_ALERT", {
+    ref, commanderId, commanderName, lat, lng, bbox, triggeredAt, message: state.data.rawText,
+  });
+
+  // Immediate acknowledgement to commander
+  await removeKeyboard(chatId,
+    `✅ EMERGENCY LOGGED. Ref: ${ref}\nSentinel sweep launched over your position.\nC2 Center has been alerted.\nStay on this channel.`
+  );
+
+  // Parallel Sentinel-2 + Sentinel-1 sweeps (fire-and-forget — reply when done)
+  Promise.allSettled([
+    callSentinelCommander({ bbox, days_back: 7, threat_type: "ENCAMPMENT" }),
+    callSentinelCommander({ bbox, days_back: 7, threat_type: "HUMAN_TRACKING" }),
+  ]).then(async (results) => {
+    const ok = results.filter((r) => r.status === "fulfilled").length;
+    if (ok > 0) await sendText(chatId, `🛰️ SENTINEL SWEEP COMPLETE (${ok}/2 passes). Data relayed to C2.`);
+  }).catch(() => {});
+}
+
+// ================================================================
+// FEATURE 2 — CIVILIAN HUMINT REPORTING (CEWN)
+// ================================================================
+
+function credibilityBase(reporter) {
+  if (!reporter?.verified) return 0.3;
+  if ((reporter.report_count || 0) < 3) return 0.5;
+  return Math.min(0.9, 0.7 + (reporter.accuracy_score || 0.5) * 0.2);
+}
+
+async function showReportMenu(chatId, verified) {
+  const tag  = verified ? "✅ Verified" : "⚪ Unverified";
+  const rows = REPORT_CATEGORIES.map((c, i) => [{ text: (i + 1) + ". " + c }]);
+  await sendKeyboard(chatId, `📋 What are you reporting? (${tag})\n\nChoose a category:`, rows);
+}
+
+async function finalizeRegistration(chatId, userId, d) {
+  const hash = hashId(userId);
+  try {
+    await db.from("civilian_reporters").upsert({
+      telegram_user_id_hash: hash,
+      tier:        (d.tier || "ANONYMOUS").toUpperCase().replace(/\s+/g, "_"),
+      lga:         d.lga      || null,
+      community:   d.community || null,
+      verified:    d.verified  || false,
+      onboarded_at: new Date().toISOString(),
+    }, { onConflict: "telegram_user_id_hash" });
+  } catch (e) { console.warn("[CEWN] Registration:", e.message); }
+  convState.set(String(chatId), { step: "REPORT_MENU", data: {} });
+  await showReportMenu(chatId, d.verified);
+}
+
+// Civilian onboarding — unknown users
+async function handleOnboarding(msg) {
+  const chatId = String(msg.chat.id);
+  const userId = String(msg.from?.id || msg.chat.id);
+  const text   = (msg.text || "").trim();
+  const state  = convState.get(chatId) || { step: "START", data: {} };
+
+  if (state.step === "START" || text === "/start" || !state.step) {
+    convState.set(chatId, { step: "AWAIT_ROLE", data: {} });
+    const rows = REPORTER_TIERS.map((t, i) => [{ text: (i + 1) + ". " + t }]);
+    await sendKeyboard(msg.chat.id, "Welcome to KrystallX Shield Community Watch Network.\n\nSelect your role:", rows);
+    return;
+  }
+
+  if (state.step === "AWAIT_ROLE") {
+    const idx  = parseInt(text) - 1;
+    const tier = REPORTER_TIERS[idx] ?? "Anonymous";
+    convState.set(chatId, { step: "AWAIT_NAME", data: { tier } });
+    await sendText(msg.chat.id, "Enter your full name (or type 'skip' to stay anonymous):");
+    return;
+  }
+
+  if (state.step === "AWAIT_NAME") {
+    const name = text.toLowerCase() === "skip" ? "Anonymous" : text.slice(0, 80);
+    convState.set(chatId, { step: "AWAIT_LGA", data: { ...state.data, name } });
+    await sendText(msg.chat.id, "Enter your LGA (Local Government Area):");
+    return;
+  }
+
+  if (state.step === "AWAIT_LGA") {
+    convState.set(chatId, { step: "AWAIT_COMMUNITY", data: { ...state.data, lga: text.slice(0, 80) } });
+    await sendText(msg.chat.id, "Enter your community or area name:");
+    return;
+  }
+
+  if (state.step === "AWAIT_COMMUNITY") {
+    convState.set(chatId, { step: "AWAIT_PHONE", data: { ...state.data, community: text.slice(0, 80) } });
+    await sendText(msg.chat.id, "Enter your phone number for SMS verification (e.g. 08012345678).\n\nType 'skip' to register without verification.");
+    return;
+  }
+
+  if (state.step === "AWAIT_PHONE") {
+    if (text.toLowerCase() === "skip" || state.data.tier === "Anonymous") {
+      await finalizeRegistration(msg.chat.id, userId, { ...state.data, verified: false });
+      return;
+    }
+    const phone = text.replace(/\D/g, "");
+    if (phone.length < 10) {
+      await sendText(msg.chat.id, "Invalid number. Try again or type 'skip':");
+      return;
+    }
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    try {
+      await sendchampSms(phone, `KrystallX Shield verification code: ${otp}. Valid 10 minutes.`);
+      convState.set(chatId, { step: "AWAIT_OTP", data: { ...state.data, phone, otp, otpExpiry: Date.now() + 600000 } });
+      await sendText(msg.chat.id, "OTP sent. Enter the 6-digit code:");
+    } catch (e) {
+      console.warn("[CEWN] SMS failed:", e.message);
+      await sendText(msg.chat.id, "SMS unavailable. Type 'skip' to continue without verification:");
+    }
+    return;
+  }
+
+  if (state.step === "AWAIT_OTP") {
+    if (Date.now() > state.data.otpExpiry) {
+      convState.set(chatId, { step: "AWAIT_PHONE", data: state.data });
+      await sendText(msg.chat.id, "OTP expired. Re-enter your phone number:");
+      return;
+    }
+    if (text !== state.data.otp) {
+      await sendText(msg.chat.id, "Incorrect code. Try again:");
+      return;
+    }
+    await finalizeRegistration(msg.chat.id, userId, { ...state.data, verified: true });
+    return;
+  }
+
+  // Unknown state — restart
+  convState.delete(chatId);
+  await handleOnboarding({ ...msg, text: "/start" });
+}
+
+// Registered civilian — report flow
+async function handleCivilianMessage(msg, reporter) {
+  const chatId = String(msg.chat.id);
+  const text   = (msg.text || "").trim();
+  const state  = convState.get(chatId) || { step: "REPORT_MENU", data: {} };
+
+  if (text === "/report" || state.step === "REPORT_MENU" || !state.step) {
+    convState.set(chatId, { step: "AWAIT_CATEGORY", data: {} });
+    await showReportMenu(msg.chat.id, reporter.verified);
+    return;
+  }
+
+  if (state.step === "AWAIT_CATEGORY") {
+    const idx      = parseInt(text) - 1;
+    const category = CATEGORY_CODES[idx] ?? "GENERAL";
+    convState.set(chatId, { step: "AWAIT_LOCATION", data: { category } });
+    await requestLocation(msg.chat.id, "📍 Where is this happening?\nShare your location or type the place name:");
+    return;
+  }
+
+  if (state.step === "AWAIT_LOCATION") {
+    // Text fallback for location
+    convState.set(chatId, { step: "AWAIT_DESCRIPTION", data: { ...state.data, locationText: text, coords: null } });
+    await sendText(msg.chat.id, "Describe what you saw. You can send a text message or a voice note:");
+    return;
+  }
+
+  if (state.step === "AWAIT_DESCRIPTION") {
+    let description = text;
+    if (msg.voice || msg.audio) {
+      try {
+        const fileId = msg.voice?.file_id || msg.audio?.file_id;
+        const mime   = msg.voice?.mime_type || "audio/ogg";
+        const fp     = await getFilePath(fileId);
+        const { base64, mimeType } = await downloadAudio(fp, mime);
+        const { text: tr } = await transcribe(base64, mimeType);
+        description = tr;
+      } catch (e) {
+        await sendText(msg.chat.id, "Could not process voice note. Please type your description:");
+        return;
+      }
+    }
+    if (!description) { await sendText(msg.chat.id, "Please describe what you saw:"); return; }
+    convState.set(chatId, { step: "AWAIT_COUNT", data: { ...state.data, description } });
+    await sendText(msg.chat.id, "How many people or vehicles? (estimate, or type 'unknown'):");
+    return;
+  }
+
+  if (state.step === "AWAIT_COUNT") {
+    await submitHumintReport(msg.chat.id, reporter, { ...state.data, count: text });
+    convState.set(chatId, { step: "REPORT_MENU", data: {} });
+    return;
+  }
+}
+
+async function handleCivilianLocation(msg, reporter) {
+  const chatId = String(msg.chat.id);
+  const state  = convState.get(chatId) || {};
+  const { latitude: lat, longitude: lng } = msg.location;
+
+  if (state.step === "AWAIT_LOCATION") {
+    convState.set(chatId, { step: "AWAIT_DESCRIPTION", data: { ...state.data, coords: { lat, lng }, locationText: null } });
+    await sendText(msg.chat.id, "📍 Location captured. Describe what you saw (text or voice note):");
+    return;
+  }
+  await showReportMenu(msg.chat.id, reporter.verified);
+}
+
+async function submitHumintReport(chatId, reporter, d) {
+  const ref   = genHumRef();
+  const score = credibilityBase(reporter);
+
+  // Insert humint_reports
+  try {
+    await db.from("humint_reports").insert({
+      reporter_id:       reporter.id,
+      raw_text:          d.description,
+      location_text:     d.locationText || null,
+      coordinates:       d.coords ? `(${d.coords.lng},${d.coords.lat})` : null,
+      lga_tagged:        reporter.lga || null,
+      threat_category:   d.category   || "GENERAL",
+      credibility_score: score,
+      status:            "PENDING",
+      received_at:       new Date().toISOString(),
+    });
+  } catch (e) { console.warn("[CEWN] humint_reports:", e.message); }
+
+  // Mirror into raw_intelligence for SOCMINT fusion pipeline
+  try {
+    await db.from("raw_intelligence").insert({
+      source:       "HUMINT_CIVILIAN",
+      ai_summary:   (d.description || "").slice(0, 500),
+      threat_score: Math.round(score * 100),
+      lga_tagged:   reporter.lga || null,
+      keywords:     [d.category],
+      payload: {
+        platform:      "telegram_cewn",
+        tier:          reporter.tier,
+        verified:      reporter.verified,
+        category:      d.category,
+        count:         d.count,
+        coords:        d.coords,
+        location_text: d.locationText,
+      },
+    });
+  } catch (e) { console.warn("[CEWN] raw_intelligence:", e.message); }
+
+  // Increment report count
+  try {
+    await db.from("civilian_reporters")
+      .update({ report_count: (reporter.report_count || 0) + 1 })
+      .eq("id", reporter.id);
+  } catch {}
+
+  // Corroboration — 3+ reports from same LGA in last 2 hours
+  if (reporter.lga) {
+    try {
+      const twoHrsAgo = new Date(Date.now() - 2 * 3600000).toISOString();
+      const { count } = await db
+        .from("humint_reports")
+        .select("*", { count: "exact", head: true })
+        .eq("lga_tagged", reporter.lga)
+        .gte("received_at", twoHrsAgo);
+
+      if ((count || 0) >= 3) {
+        await db.from("raw_intelligence").insert({
+          source:       "HUMINT_CLUSTER",
+          ai_summary:   `HUMINT CLUSTER: ${count} reports from ${reporter.lga} in last 2h`,
+          threat_score: 85,
+          lga_tagged:   reporter.lga,
+          keywords:     ["cluster", (d.category || "").toLowerCase()],
+          payload:      { lga: reporter.lga, count, category: d.category, window_hours: 2 },
+        });
+        await realtimeBroadcast("humint_cluster", "CLUSTER_ALERT", {
+          lga: reporter.lga, count, category: d.category, ref,
+        });
+        console.warn("[CEWN] CLUSTER detected — " + reporter.lga + " × " + count);
+      }
+    } catch (e) { console.warn("[CEWN] Corroboration check:", e.message); }
+  }
+
+  await removeKeyboard(chatId, `✅ Report received. Ref: ${ref}\nThank you for keeping your community safe.`);
+}
+
+// ================================================================
+// ROLE ROUTER — sits in front of the webhook, classifies every message
+// Military | Civilian | Onboarding
+// ================================================================
+
+async function routeMessage(msg) {
+  const chatId = String(msg.chat.id);
+  const userId = String(msg.from?.id || msg.chat.id);
+  const text   = (msg.text || "").trim();
+  const state  = convState.get(chatId);
+
+  // ── MILITARY: match on humint_sources (existing table) ──────────
+  const { data: military } = await db
+    .from("humint_sources")
+    .select("id, display_name, rank, unit, active")
+    .eq("telegram_user_id", userId)
+    .single();
+
+  if (military?.active) {
+    const name = ((military.rank || "") + " " + military.display_name).trim();
+
+    // Pending TIC location response — location message or text fallback
+    if (state?.step === "TIC_AWAIT_LOCATION") {
+      if (msg.location) {
+        await processTicLocation(msg.chat.id, msg.location.latitude, msg.location.longitude, state);
+      } else if (text) {
+        // Text fallback — resolve via state bbox centre
+        const bbox = resolveBbox({ location: text, state: text });
+        const lat  = (bbox[1] + bbox[3]) / 2;
+        const lng  = (bbox[0] + bbox[2]) / 2;
+        await processTicLocation(msg.chat.id, lat, lng, state);
+      }
+      return;
+    }
+
+    // TIC keyword on any text message
+    if (text && TIC_KEYWORDS.test(text)) {
+      await handleTicEmergency(msg, military.id, name);
+      return;
+    }
+
+    // Voice / audio → existing full SITREP pipeline
+    if (msg.voice || msg.audio) {
+      runPipeline(msg, name).catch((e) => console.error("[Router] Military pipeline:", e.message));
+    }
+    return;
+  }
+
+  // ── CIVILIAN: match on hashed telegram_user_id ──────────────────
+  const hash = hashId(userId);
+  const { data: reporter } = await db
+    .from("civilian_reporters")
+    .select("*")
+    .eq("telegram_user_id_hash", hash)
+    .single();
+
+  if (reporter) {
+    if (msg.location) {
+      await handleCivilianLocation(msg, reporter);
+    } else {
+      await handleCivilianMessage(msg, reporter);
+    }
+    return;
+  }
+
+  // ── ONBOARDING: unknown user ─────────────────────────────────────
+  await handleOnboarding(msg);
+}
+
+// ================================================================
 // PIPELINE
 // ================================================================
 
@@ -1118,10 +1587,9 @@ app.post("/webhook/telegram", (req, res) => {
   }
   res.sendStatus(200);
   const msg = req.body?.message;
-  if (!msg?.voice && !msg?.audio) return;
-  const name = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ")
-    || msg.from?.username || "Unknown";
-  runPipeline(msg, name).catch((e) => console.error("[Webhook] Unhandled:", e.message));
+  if (!msg) return;
+  // Role router handles military / civilian / onboarding for all message types
+  routeMessage(msg).catch((e) => console.error("[Webhook] Unhandled:", e.message));
 });
 
 app.get("/webhook/telegram/info", async (_req, res) => {
