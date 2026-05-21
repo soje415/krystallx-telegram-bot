@@ -588,23 +588,49 @@ function buildKxsPdf(data) {
     let y = 26;
 
     if (module === "SENTINEL") {
-      y = secHdr("SCENE COMPARISON — T1 (BEFORE) vs T2 (AFTER)", y);
-      const gap   = 10;
-      const hW    = (W - 2 * M - gap) / 2;
-      const hdrH  = 20;
-      const imgH  = Math.floor((H - 18 - 26 - 21 - hdrH - 120) - 10);
-      const cardH = hdrH + imgH + 8;
+      // ── AOI info bar ──────────────────────────────────────────────
+      const aoiH    = 54;
+      const tblW    = W - 2 * M;
+      fillR(M, y, tblW, aoiH, PANEL);
+      fillR(M, y, tblW, 16,   DARK_HDR);
+      doc.rect(M, y, tblW, aoiH).strokeColor(AMBER).lineWidth(1).stroke();
+      doc.fillColor(AMBER).font("Helvetica-Bold").fontSize(9)
+         .text("AREA OF INTEREST", M + 6, y + 4, { lineBreak: false });
 
-      const drawCard = (x, label, date, b64) => {
-        fillR(x, y, hW, cardH, PANEL);
-        fillR(x, y, hW, hdrH, DARK_HDR);
-        doc.rect(x, y, hW, cardH).strokeColor(AMBER).lineWidth(0.8).stroke();
+      const aoiY    = y + 20;
+      const location = (data.location || data.state_name || "Nigeria").toUpperCase();
+      const bbox     = (data.bbox || []).map((n) => (+n).toFixed(4));
+      const bboxStr  = bbox.length === 4
+        ? `${bbox[1]}°N ${bbox[0]}°E  →  ${bbox[3]}°N ${bbox[2]}°E`
+        : "N/A";
+      const dateRange = ((data.scene1_date || "—").slice(0, 10)) + "  →  " + ((data.scene2_date || "—").slice(0, 10));
+      const col1 = M + 8, col2 = M + 190, col3 = M + 380;
+
+      doc.fillColor("#a0a0a0").font("Helvetica-Bold").fontSize(7).text("LOCATION",       col1, aoiY,      { lineBreak: false });
+      doc.fillColor("#ffffff").font("Helvetica").fontSize(8.5)    .text(location,         col1, aoiY + 10, { lineBreak: false });
+      doc.fillColor("#a0a0a0").font("Helvetica-Bold").fontSize(7) .text("BBOX (SW → NE)", col2, aoiY,      { lineBreak: false });
+      doc.fillColor("#ffffff").font("Helvetica").fontSize(7.5)    .text(bboxStr,           col2, aoiY + 10, { lineBreak: false });
+      doc.fillColor("#a0a0a0").font("Helvetica-Bold").fontSize(7) .text("DATE RANGE",     col3, aoiY,      { lineBreak: false });
+      doc.fillColor("#ffffff").font("Helvetica").fontSize(8)      .text(dateRange,         col3, aoiY + 10, { lineBreak: false });
+
+      y += aoiH + 8;
+
+      // ── T1 and T2 stacked vertically, each full-width ─────────────
+      const hdrH  = 20;
+      const gap   = 8;
+      const cardH = Math.floor(((H - 18) - y - gap) / 2) - 2;
+      const imgH  = cardH - hdrH - 6;
+
+      const drawCard = (cardY, label, date, b64) => {
+        fillR(M, cardY, tblW, cardH, PANEL);
+        fillR(M, cardY, tblW, hdrH,  DARK_HDR);
+        doc.rect(M, cardY, tblW, cardH).strokeColor(AMBER).lineWidth(0.8).stroke();
         doc.fillColor(AMBER).font("Helvetica-Bold").fontSize(9)
-           .text(label + " · " + (date || "").slice(0, 10), x + 7, y + 6, { lineBreak: false });
-        const imgX = x + 4;
-        const imgY = y + hdrH + 3;
-        const imgW = hW - 8;
-        const imgBoxH = imgH - 6;
+           .text(label + "  ·  " + (date || "—").slice(0, 10), M + 7, cardY + 6, { lineBreak: false });
+        const imgX    = M + 4;
+        const imgY    = cardY + hdrH + 3;
+        const imgW    = tblW - 8;
+        const imgBoxH = imgH - 2;
         if (b64) {
           try {
             doc.image(Buffer.from(stripDataUrl(b64), "base64"),
@@ -619,16 +645,9 @@ function buildKxsPdf(data) {
         }
       };
 
-      drawCard(M,            "T1 BEFORE", data.scene1_date, data.t1_image);
-      drawCard(M + hW + gap, "T2 AFTER",  data.scene2_date, data.t2_image);
-      y += cardH + 10;
-
-      if (data.change_summary) {
-        doc.fillColor(AMBER).font("Helvetica-Bold").fontSize(8)
-           .text("CHANGE SUMMARY:", M, y, { lineBreak: false });
-        doc.fillColor("#dcdcdc").font("Helvetica").fontSize(8)
-           .text("  " + data.change_summary.slice(0, 240), M + 100, y, { width: W - 2 * M - 100 });
-      }
+      drawCard(y,              "T1  BEFORE", data.scene1_date, data.t1_image);
+      drawCard(y + cardH + gap, "T2  AFTER",  data.scene2_date, data.t2_image);
+      y += (cardH + gap) * 2;
 
     } else if (module === "HUMINT") {
       const ent  = data.entities || {};
@@ -1186,13 +1205,17 @@ async function routeMessage(msg) {
   }
 
   if (text === "/help") {
-    // Show role-appropriate help after checking registration
     const { data: military } = await db
       .from("humint_sources")
       .select("active")
       .eq("telegram_user_id", userId)
       .maybeSingle();
     await sendText(chatId, military?.active ? MILITARY_HELP : HELP_TEXT);
+    return;
+  }
+
+  if (text === "/myid") {
+    await sendText(chatId, "Your Telegram user ID is:\n\n" + userId + "\n\nShare this with your admin to be registered as a commander.");
     return;
   }
 
